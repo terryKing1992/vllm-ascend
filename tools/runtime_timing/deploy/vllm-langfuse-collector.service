@@ -1,0 +1,19 @@
+[Unit]
+Description=Optional vLLM Langfuse collector
+
+[Service]
+Type=simple
+# Example paths: adapt to the collector installation, not the model environment.
+WorkingDirectory=/opt/ascend-observe
+EnvironmentFile=/etc/vllm-langfuse.env
+ExecStart=/opt/observe-venv/bin/python /opt/ascend-observe/collector.py --port 18765
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+# Example resource budgets; tune independently of the model service.
+CPUQuota=50%
+MemoryMax=512M
+TasksMax=32
+
+[Install]
+WantedBy=multi-user.target
