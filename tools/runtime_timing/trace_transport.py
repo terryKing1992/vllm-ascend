@@ -3,6 +3,8 @@
 import json
 import os
 import socket
+import sys
+from contextlib import suppress
 from dataclasses import asdict, dataclass, field
 
 MAX_DATAGRAM_BYTES = 8192
@@ -31,12 +33,18 @@ class Packet:
 
 
 class DatagramEmitter:
-    def __init__(self, port):
+    def __init__(self, port, diagnostic_log=False):
         self.address = ("127.0.0.1", port)
+        self.diagnostic_log = diagnostic_log
         self.socket = None
         self.pid = os.getpid()
         self.dropped = 0
         self.sent = 0
+
+    def _log(self, message):
+        if self.diagnostic_log:
+            with suppress(Exception):
+                print(f"[timing-send] {message}", file=sys.stderr, flush=True)
 
     def submit(self, packet):
         if not packet.contexts:
@@ -47,6 +55,7 @@ class DatagramEmitter:
         data = json.dumps(body, separators=(",", ":"), allow_nan=False).encode("utf-8")
         if len(data) > MAX_DATAGRAM_BYTES:
             self.dropped += 1
+            self._log(f"dropped=oversize bytes={len(data)} limit={MAX_DATAGRAM_BYTES}")
             return
         if self.pid != os.getpid():
             if self.socket is not None:
@@ -65,8 +74,14 @@ class DatagramEmitter:
         try:
             self.socket.sendto(data, self.address)
             self.sent += 1  # Accepted by local kernel, not a delivery acknowledgement.
-        except OSError:
+            names = ",".join(record.name for record in packet.records)
+            self._log(
+                f"sent packet={self.sent} bytes={len(data)} port={self.address[1]} "
+                f"requests={len(packet.contexts)} records={len(packet.records)} names={names}"
+            )
+        except OSError as error:
             self.dropped += 1
+            self._log(f"dropped=socket error={type(error).__name__} port={self.address[1]}")
 
 
 def decode_packet(data):

@@ -46,6 +46,7 @@ class Config:
     max_records: int = 16
     max_requests: int = 4
     collector_port: int = 18765
+    diagnostic_log: bool = False
 
 
 def parse_traceparent(value):
@@ -64,7 +65,9 @@ def selected(context, rate):
 class Runtime:
     def __init__(self, config, exporter=None):
         self.config = config
-        self.exporter = exporter if exporter is not None else DatagramEmitter(config.collector_port)
+        self.exporter = (
+            exporter if exporter is not None else DatagramEmitter(config.collector_port, config.diagnostic_log)
+        )
         self.request = ContextVar("runtime_request", default=None)
         self.stage = ContextVar("runtime_stage", default=None)
         self.scheduling = ContextVar("runtime_scheduling", default=False)

@@ -13,14 +13,19 @@ from trace_transport import MAX_DATAGRAM_BYTES, decode_packet
 
 
 class Collector:
-    def __init__(self, port, exporter):
+    def __init__(self, port, exporter, diagnostic_log=False):
         self.exporter = exporter
+        self.diagnostic_log = diagnostic_log
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.socket.bind(("127.0.0.1", port))
         self.socket.settimeout(0.5)
         self.stopped = False
         self.invalid = 0
         self.received = 0
+
+    def log(self, message):
+        if self.diagnostic_log:
+            print(f"[timing-recv] {message}", file=sys.stderr, flush=True)
 
     def run(self):
         try:
@@ -29,15 +34,23 @@ class Collector:
                     data, _ = self.socket.recvfrom(MAX_DATAGRAM_BYTES + 1)
                 except TimeoutError:
                     continue
-                except OSError:
+                except OSError as error:
                     self.invalid += 1
+                    self.log(f"socket_error={type(error).__name__} invalid={self.invalid}")
                     continue
                 try:
                     packet = decode_packet(data)
                     self.exporter.submit(packet)
                     self.received += 1
-                except Exception:
+                    names = ",".join(record.name for record in packet.records)
+                    self.log(
+                        f"received packet={self.received} bytes={len(data)} "
+                        f"source_pid={packet.metadata.get('source_pid')} requests={len(packet.contexts)} "
+                        f"records={len(packet.records)} names={names}"
+                    )
+                except Exception as error:
                     self.invalid += 1
+                    self.log(f"invalid error={type(error).__name__} bytes={len(data)} total={self.invalid}")
         finally:
             self.socket.close()
             self.exporter.close()
@@ -53,6 +66,7 @@ def main():
     parser.add_argument("--queue-size", type=int, default=256)
     parser.add_argument("--flush-at", type=int, default=256)
     parser.add_argument("--flush-interval", type=float, default=2)
+    parser.add_argument("--diagnostic-log", action="store_true", help="print received packet summaries to stderr")
     args = parser.parse_args()
     if not 1024 <= args.port <= 65535 or args.queue_size < 1 or not 1 <= args.flush_at <= 2048:
         parser.error("invalid port or queue/batch limits")
@@ -70,7 +84,7 @@ def main():
             parser.error("set LANGFUSE_BASE_URL to your server")
     sink_factory = JsonLogSink if args.output == "log" else LangfuseSink
     exporter = BufferedExporter(CollectorConfig(args.queue_size, args.flush_at, args.flush_interval), sink_factory)
-    collector = Collector(args.port, exporter)
+    collector = Collector(args.port, exporter, args.diagnostic_log)
     signal.signal(signal.SIGTERM, collector.stop)
     signal.signal(signal.SIGINT, collector.stop)
     print(f"Collector listening on 127.0.0.1:{args.port}, output={args.output}", file=sys.stderr, flush=True)

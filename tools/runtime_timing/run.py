@@ -61,6 +61,11 @@ def main():
     parser.add_argument("--collector-port", type=int, default=Config.collector_port)
     parser.add_argument("--max-records", type=int, default=Config.max_records)
     parser.add_argument("--max-requests", type=int, default=Config.max_requests)
+    parser.add_argument(
+        "--diagnostic-log",
+        action="store_true",
+        help="print sampled UDP send results to the model process stderr",
+    )
     args = parser.parse_args()
     config = vars(args).copy()
     directory = config.pop("output_dir")

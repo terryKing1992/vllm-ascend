@@ -233,6 +233,28 @@ class TestTracing(unittest.TestCase):
         sock.setblocking.assert_called_once_with(False)
         self.assertEqual(sock.sendto.call_args.args[1], ("127.0.0.1", 18765))
 
+    def test_sender_diagnostic_log_reports_packet(self):
+        sock = Mock()
+        emitter = DatagramEmitter(18765, diagnostic_log=True)
+        emitter.socket = sock
+        packet = Packet(tuple(self.carrier()["contexts"]), [Record("stage", 1, 2)])
+        stream = io.StringIO()
+        with contextlib.redirect_stderr(stream):
+            emitter.submit(packet)
+        self.assertIn("[timing-send] sent packet=1", stream.getvalue())
+        self.assertIn("names=stage", stream.getvalue())
+
+    def test_receiver_diagnostic_log_is_separate_from_json_output(self):
+        sink = Mock()
+        collector = Collector(0, sink, diagnostic_log=True)
+        stream = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(stream):
+                collector.log("received packet=1 names=stage")
+        finally:
+            collector.socket.close()
+        self.assertIn("[timing-recv] received packet=1 names=stage", stream.getvalue())
+
     def test_caps_and_business_exception_preserved(self):
         self.runtime.config = Config(sample_rate=1, max_records=2)
         stage = self.runtime.wrap_stage(lambda: None, "stage")

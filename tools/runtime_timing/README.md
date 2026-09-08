@@ -4,7 +4,11 @@
 完成下面第 1、2 步的注入和服务启动后，在另一个终端执行：
 
 ```bash
-python tools/runtime_timing/collector.py --output log --port 18765 > timing.jsonl
+python tools/runtime_timing/collector.py \
+  --output log \
+  --port 18765 \
+  --diagnostic-log \
+  > timing.jsonl 2> timing-collector.log
 ```
 
 省略 `--output log` 也是日志模式。不加重定向则直接显示在 collector 终端。
@@ -50,10 +54,15 @@ JSON 编码仍在模型线程中执行，大小与数量受限；它不是零开
 ```bash
 python tools/runtime_timing/run.py \
   --output-dir ./observe-inject-v1 \
-  --sample-rate 0.01 \
-  --every-n-steps 10 \
-  --collector-port 18765
+  --sample-rate 1 \
+  --every-n-steps 1 \
+  --collector-port 18765 \
+  --diagnostic-log
 ```
+
+`--diagnostic-log` 会把每个已采样 UDP 包的发送结果写到模型进程 stderr，前缀为
+`[timing-send]`。它只适合联调；确认链路正常后应重新生成生产注入目录时移除此参数。
+生产环境建议恢复 `--sample-rate 0.01 --every-n-steps 10`，减少热路径日志和打点开销。
 
 run.py 完成后就退出。目标目录应位于本地磁盘且必须是新目录；工具拒绝覆盖既有目录，避免破坏正在使用的版本。
 其中仅包含 timing_probe.py、trace_transport.py、config.json、sitecustomize.py 和 enabled 标记。
@@ -97,6 +106,33 @@ collector 可以晚于模型启动，也可以单独停止、重启。离线期�
 只监听 127.0.0.1，必须和相应模型进程处于同一网络命名空间。
 容器部署建议独立 collector 容器并共享网络命名空间；禁止把它作为模型容器的必需健康依赖。
 每个推理节点部署一个 collector，所有节点使用一致的项目配置。
+
+## 如何确认数据已经收集
+
+完成一次 `/v1/chat/completions` 或 `/v1/completions` 请求后，按顺序检查：
+
+```bash
+# 1. 模型日志：确认发送端已经把采样包交给本机 UDP
+grep '\[timing-send\]' /path/to/vllm-service.log | tail -20
+
+# 2. collector 诊断日志：确认包已收到并成功解析
+tail -f timing-collector.log
+
+# 3. JSONL 数据：查看最近的阶段耗时
+tail -20 timing.jsonl
+
+# 4. 按 trace_id 查看同一次请求的全部记录（替换 TRACE_ID）
+grep '"trace_id": "TRACE_ID"' timing.jsonl
+```
+
+发送端日志形如 `sent ... names=scheduler.schedule`，只表示本机内核接收了 UDP 包；接收端日志
+形如 `received ... names=scheduler.schedule`，表示 collector 已接收并解析。`timing.jsonl` 每行是一个
+JSON span，重点字段是 `name`、`trace_id`、`request_id`、`duration_ms`、`metadata.phase` 和
+`metadata.step`。同一 `trace_id` 的记录属于同一请求，`parent_span_id` 用于还原父子关系。
+
+如果发送端有 `sent` 而接收端没有 `received`，检查两边端口以及是否共享网络命名空间。如果发送端
+完全没有日志，确认模型是用注入目录所在的 `PYTHONPATH` 重启的，并使用上述采样率 1 的联调配置。
+如果接收端有 `received` 而 JSONL 为空，查看 `timing-collector.log` 中的 export failed 信息。
 
 提供 [systemd 示例](deploy/vllm-langfuse-collector.service)，其中有独立 CPU、内存及线程预算。
 路径和预算是示例，需要按部署调整；文件未自动安装。
@@ -173,7 +209,8 @@ phase 以是否已有输出 token 区分 prefill / decode，首轮 prefix-cache 
 | 部分 worker 未注入 | 业务消息仍可解析，丢失该 worker 的阶段数据 |
 
 每个 wrapper 的原业务函数只执行一次。fallback 不重试业务函数。
-观测错误不写模型 stderr，避免日志管道阻塞；本进程熔断状态只存在内存中，重启后重新尝试。
+默认情况下观测错误不写模型 stderr，避免日志管道阻塞；开启 `--diagnostic-log` 后会写发送结果。
+本进程熔断状态只存在内存中，重启后重新尝试。
 SystemExit、KeyboardInterrupt、任务取消等正常控制流程不作为可忽略的观测错误吞掉。
 
 此约定覆盖已测试的普通异常和通信故障，不覆盖 native 崩溃、解释器损坏、系统级 OOM、操作系统停顿或任意无限循环。
