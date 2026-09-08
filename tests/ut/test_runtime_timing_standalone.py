@@ -26,7 +26,7 @@ if (TOOL_DIR / ".test-deps").is_dir():
 
 from collector import Collector  # noqa: E402
 from run import prepare  # noqa: E402
-from timing_probe import Config, RequestMiddleware, Runtime, parse_traceparent, selected  # noqa: E402
+from timing_probe import Config, RequestMiddleware, Runtime, package_version, parse_traceparent, selected  # noqa: E402
 from trace_export import BufferedExporter, CollectorConfig, JsonLogSink, LangfuseSink  # noqa: E402
 from trace_transport import DatagramEmitter, Packet, Record, decode_packet  # noqa: E402
 
@@ -52,6 +52,10 @@ class TestTracing(unittest.TestCase):
         self.assertEqual(Record().start_ns, 0)
         self.assertEqual(Packet().contexts, ())
         self.assertEqual(Packet().records, [])
+
+    def test_package_version_failure_is_diagnostic_only(self):
+        with patch("timing_probe.importlib.metadata.version", side_effect=RuntimeError("broken metadata")):
+            self.assertEqual(package_version("vllm"), "unknown")
 
     def request(self, trace_id=TRACE_ID):
         return SimpleNamespace(trace_headers={"traceparent": f"00-{trace_id}-{PARENT_ID}-01"}, num_output_tokens=0)
@@ -393,19 +397,24 @@ class TestTracing(unittest.TestCase):
         wrapped = self.runtime.wrap_trace_headers(original)
         self.assertIsNone(asyncio.run(wrapped(None, {"traceparent": "invalid"})))
 
-    def test_vllm_023_base_serving_trace_header_method_is_patched(self):
-        module_name = "vllm.entrypoints.openai.engine.serving"
+    def test_old_and_new_base_serving_trace_header_methods_are_patched(self):
+        for module_name in (
+            "vllm.entrypoints.openai.engine.serving",
+            "vllm.entrypoints.serve.engine.serving",
+            "vllm.entrypoints.generate.base.serving",
+        ):
+            with self.subTest(module=module_name):
 
-        class BaseServing:
-            async def _get_trace_headers(self, headers):
-                return None
+                class BaseServing:
+                    async def _get_trace_headers(self, headers):
+                        return None
 
-        BaseServing.__module__ = module_name
-        module = SimpleNamespace(__name__=module_name, BaseServing=BaseServing)
-        runtime = Runtime(Config(sample_rate=1), self.collector)
-        runtime.patch_module(module)
-        headers = {"traceparent": f"00-{TRACE_ID}-{PARENT_ID}-01"}
-        self.assertEqual(asyncio.run(BaseServing()._get_trace_headers(headers)), headers)
+                BaseServing.__module__ = module_name
+                module = SimpleNamespace(__name__=module_name, BaseServing=BaseServing)
+                runtime = Runtime(Config(sample_rate=1), self.collector)
+                runtime.patch_module(module)
+                headers = {"traceparent": f"00-{TRACE_ID}-{PARENT_ID}-01"}
+                self.assertEqual(asyncio.run(BaseServing()._get_trace_headers(headers)), headers)
 
     def test_decoder_rejects_malformed_packets(self):
         packet = Packet(tuple(self.carrier()["contexts"]), [Record("stage", 1, 2)])

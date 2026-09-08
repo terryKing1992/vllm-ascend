@@ -2,6 +2,7 @@
 
 完整的测试用例、联调命令和验收标准见 [TESTING.md](TESTING.md)。没有日志或 JSONL 为空时，按照
 [TROUBLESHOOTING.md](TROUBLESHOOTING.md) 逐层排查。
+多版本支持范围和升级验证方法见 [COMPATIBILITY.md](COMPATIBILITY.md)。
 
 **暂未安装 Langfuse 时，collector 默认输出 JSON 日志，不需要 SDK 或密钥。**
 完成下面第 1、2 步的注入和服务启动后，在另一个终端执行：

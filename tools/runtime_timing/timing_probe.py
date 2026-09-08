@@ -3,6 +3,7 @@
 import copy
 import functools
 import importlib.abc
+import importlib.metadata
 import inspect
 import re
 import sys
@@ -40,6 +41,7 @@ SCHEDULER_MODULES = (
 RUNNER_MODULES = ("vllm_ascend.worker.model_runner_v1", "vllm_ascend.worker.v2.model_runner")
 TRACE_HEADER_MODULES = (
     "vllm.entrypoints.openai.engine.serving",
+    "vllm.entrypoints.serve.engine.serving",
     "vllm.entrypoints.generate.base.serving",
     "vllm.entrypoints.pooling.base.serving",
 )
@@ -66,6 +68,15 @@ def parse_traceparent(value):
 
 def selected(context, rate):
     return bool(context and context["sampled"] and int(context["trace_id"], 16) < rate * (1 << 128))
+
+
+def package_version(name):
+    try:
+        return importlib.metadata.version(name)
+    except importlib.metadata.PackageNotFoundError:
+        return "not-installed"
+    except Exception:
+        return "unknown"
 
 
 class Runtime:
@@ -383,7 +394,8 @@ class Runtime:
         sys.meta_path.insert(0, HookFinder(self, frozenset(modules)))
         self.log(
             f"installed port={self.config.collector_port} sample_rate={self.config.sample_rate} "
-            f"every_n_steps={self.config.every_n_steps}"
+            f"every_n_steps={self.config.every_n_steps} vllm={package_version('vllm')} "
+            f"vllm_ascend={package_version('vllm-ascend')}"
         )
         for name in modules:
             if name in sys.modules:
