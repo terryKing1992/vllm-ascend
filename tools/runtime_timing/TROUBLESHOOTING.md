@@ -10,6 +10,7 @@
 | `[timing-probe] module=... patched=...` | 模型进程 | 目标 vLLM 模块已导入，并完成方法包装 |
 | `[timing-probe] request ... sampled=true` | API 进程 | 请求已进入中间件并被采样 |
 | `[timing-probe] engine_request ...` | AsyncLLM 进程 | `add_request` 已收到有效 `traceparent`；可作为 HTTP 中间件未命中时的兼容诊断 |
+| `[timing-probe] trace_headers ...` | API 进程 | vLLM 0.23 已提取请求头并将其继续传给 AsyncLLM |
 | `[timing-send] sent ...` | 模型或 worker 进程 | UDP 包已交给本机内核 |
 | `[timing-recv] received ...` | collector 进程 | UDP 包已收到并成功解析 |
 | JSON 行 | `timing.jsonl` | collector 已把一个阶段写入结果文件 |
@@ -257,8 +258,10 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 [timing-probe] engine_request request_id=... trace_id=12345678901234567890123456789012 sampled=true
 ```
 
-`Received a request with trace context but tracing is disabled` 是 vLLM 自带 OpenTelemetry tracing
-未启用时的提示，不代表本工具被禁用。无需为了本工具启用 vLLM profiler 或 OTLP tracing。
+vLLM 0.23 默认会在自身 OpenTelemetry tracing 未启用时打印
+`Received a request with trace context but tracing is disabled`，并丢弃传给 AsyncLLM 的 trace headers。
+本工具会在生成和 pooling 请求入口提前提取有效的 `traceparent/tracestate`，此时应看到
+`[timing-probe] trace_headers ...`，随后看到 `engine_request`。无需启用 vLLM profiler 或 OTLP tracing。
 
 `traceparent` 最后两位为 `00` 时，上游明确禁止采样；联调时使用 `01`。同时确认新注入目录使用 `sample_rate=1`。
 

@@ -367,6 +367,32 @@ class TestTracing(unittest.TestCase):
             stream.getvalue(),
         )
 
+    def test_trace_headers_survive_when_vllm_tracing_is_disabled(self):
+        runtime = Runtime(Config(sample_rate=1, diagnostic_log=True), self.collector)
+        original = Mock(side_effect=AssertionError("valid trace context must not be discarded"))
+        wrapped = runtime.wrap_trace_headers(original)
+        headers = {
+            "traceparent": f"00-{TRACE_ID}-{PARENT_ID}-01",
+            "tracestate": "vendor=value",
+            "authorization": "secret",
+        }
+        stream = io.StringIO()
+        with contextlib.redirect_stderr(stream):
+            extracted = asyncio.run(wrapped(None, headers))
+        self.assertEqual(
+            extracted,
+            {"traceparent": headers["traceparent"], "tracestate": "vendor=value"},
+        )
+        original.assert_not_called()
+        self.assertIn(f"[timing-probe] trace_headers trace_id={TRACE_ID} sampled=true", stream.getvalue())
+
+    def test_invalid_trace_headers_keep_vllm_behavior(self):
+        async def original(owner, headers):
+            return None
+
+        wrapped = self.runtime.wrap_trace_headers(original)
+        self.assertIsNone(asyncio.run(wrapped(None, {"traceparent": "invalid"})))
+
     def test_decoder_rejects_malformed_packets(self):
         packet = Packet(tuple(self.carrier()["contexts"]), [Record("stage", 1, 2)])
         data = json.dumps(asdict(packet)).encode()

@@ -38,6 +38,10 @@ SCHEDULER_MODULES = (
     "vllm_ascend.patch.platform.patch_balance_schedule",
 )
 RUNNER_MODULES = ("vllm_ascend.worker.model_runner_v1", "vllm_ascend.worker.v2.model_runner")
+TRACE_HEADER_MODULES = (
+    "vllm.entrypoints.generate.base.serving",
+    "vllm.entrypoints.pooling.base.serving",
+)
 
 
 @dataclass(frozen=True)
@@ -292,6 +296,27 @@ class Runtime:
 
         return add_request
 
+    def wrap_trace_headers(self, original):
+        @functools.wraps(original)
+        async def trace_headers(owner, headers):
+            try:
+                traceparent = headers.get("traceparent")
+                context = parse_traceparent(traceparent)
+            except Exception:
+                context = None
+            if context is None:
+                return await original(owner, headers)
+            extracted = {"traceparent": traceparent}
+            with suppress(Exception):
+                tracestate = headers.get("tracestate")
+                if tracestate:
+                    extracted["tracestate"] = tracestate
+            sampled = selected(context, self.config.sample_rate)
+            self.log(f"trace_headers trace_id={context['trace_id']} sampled={str(sampled).lower()}")
+            return extracted
+
+        return trace_headers
+
     def patch_method(self, owner, name, factory):
         original = getattr(owner, name, None)
         if original is not None and not getattr(original, "_runtime_timing_wrapped", False):
@@ -323,6 +348,11 @@ class Runtime:
         elif name == "vllm.v1.engine.async_llm":
             if self.patch_method(module.AsyncLLM, "add_request", self.wrap_add_request):
                 patched.append("AsyncLLM.add_request")
+        elif name in TRACE_HEADER_MODULES:
+            for obj in tuple(vars(module).values()):
+                if inspect.isclass(obj) and obj.__module__ == name and "_get_trace_headers" in vars(obj):
+                    if self.patch_method(obj, "_get_trace_headers", self.wrap_trace_headers):
+                        patched.append(f"{obj.__name__}._get_trace_headers")
         elif name == "vllm.entrypoints.openai.api_server":
 
             def wrap_build(original):
@@ -345,6 +375,7 @@ class Runtime:
         modules = (
             *SCHEDULER_MODULES,
             *RUNNER_MODULES,
+            *TRACE_HEADER_MODULES,
             "vllm.v1.engine.async_llm",
             "vllm.entrypoints.openai.api_server",
         )
