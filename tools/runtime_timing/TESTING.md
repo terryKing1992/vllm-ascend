@@ -2,6 +2,25 @@
 
 本文用于验证三个目标：耗时记录能够从模型进程送达 collector、记录能够按请求关联，以及观测组件故障时模型服务仍然可用。
 
+## 工作原理
+
+`run.py` 不启动模型，也不收集数据。它生成一个固定的注入目录，其中的 `sitecustomize.py` 会在 Python 进程启动时自动加载打点模块。模型服务通过 `PYTHONPATH` 加载该目录后，打点模块会在目标 vLLM 模块导入时包装调度和执行方法。
+
+请求进入时生成或继承 `trace_id`，随后通过 `trace_headers` 进入调度器。调度器把关联信息附到本轮输出，worker 从中恢复请求上下文，并为实际执行的阶段记录开始和结束时间。采样记录编码成小型 JSON 数据包，通过本机非阻塞 UDP 发送给独立 collector。collector 解析数据包后，把每个阶段写成 `timing.jsonl` 中的一行。
+
+```text
+HTTP 请求
+  → 请求中间件生成或继承 trace_id
+  → AsyncLLM 把 traceparent 传入调度请求
+  → scheduler 关联 request_id、prefill/decode 和 step
+  → runner wrapper 记录各阶段 Host 耗时
+  → [timing-send] 非阻塞发送到 127.0.0.1:18765
+  → [timing-recv] collector 接收并解析
+  → 每个阶段写成一行 JSON
+```
+
+模型进程不会等待 collector，也不会从 collector 接收确认。collector 不可用时，当前观测数据可能丢失，推理流程继续执行。
+
 ## 1. 测试前准备
 
 在 vLLM Ascend 仓库根目录执行命令。真实服务联调需要可正常运行的 vLLM Ascend 环境；基础测试不需要 NPU、Langfuse SDK 或服务器密钥。
@@ -118,6 +137,15 @@ PYTHONPATH="$PWD/observe-inject-test${PYTHONPATH:+:$PYTHONPATH}" \
 
 将模型路径和并行参数替换为测试环境的实际值。必须重启模型进程，给已经运行的进程修改 `PYTHONPATH` 不会生效。容器或多节点环境中，模型进程与 collector 必须共享网络命名空间，远程 worker 也必须拥有并加载同一版本的注入目录。
 
+新注入目录启用诊断日志后，模型启动日志应立即出现：
+
+```text
+[timing-probe] installed port=18765 sample_rate=1.0 every_n_steps=1
+[timing-probe] module=vllm.entrypoints.openai.api_server patched=build_app
+```
+
+后续目标模块被导入时还会打印对应的 `module=... patched=...`。出现 `patched=none` 表示该模块存在，但当前版本中没有匹配到预期方法。完全没有 `[timing-probe]` 表示模型没有加载这个注入目录。
+
 ## 6. 发送固定 Trace ID 的请求
 
 非流式请求：
@@ -148,7 +176,7 @@ curl -N http://127.0.0.1:8000/v1/chat/completions \
 grep '\[timing-send\]' /path/to/vllm-service.log | tail -20
 ```
 
-预期出现 `sent`，并包含 `scheduler.schedule`、`runner.execute_model` 或 `vllm.request` 等阶段名。这里的 `sent` 只表示本机内核接受了 UDP 数据。
+预期先出现 `[timing-probe] request ... sampled=true`，然后出现 `[timing-send] sent`，并包含 `scheduler.schedule`、`runner.execute_model` 或 `vllm.request` 等阶段名。这里的 `sent` 只表示本机内核接受了 UDP 数据。
 
 再查看 collector 日志：
 

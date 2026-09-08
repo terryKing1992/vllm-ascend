@@ -8,6 +8,7 @@ import re
 import sys
 import time
 import uuid
+from contextlib import suppress
 from contextvars import ContextVar
 from dataclasses import dataclass
 
@@ -73,6 +74,11 @@ class Runtime:
         self.scheduling = ContextVar("runtime_scheduling", default=False)
         self.disabled = False
         self.failures = 0
+
+    def log(self, message):
+        if self.config.diagnostic_log:
+            with suppress(Exception):
+                print(f"[timing-probe] {message}", file=sys.stderr, flush=True)
 
     def safe(self, operation, *args):
         """Only instrumentation enters here; never catch/retry business execution."""
@@ -283,23 +289,31 @@ class Runtime:
             wrapped = factory(original)
             wrapped._runtime_timing_wrapped = True
             setattr(owner, name, wrapped)
+            return True
+        return False
 
     def patch_module(self, module):
         if self.disabled:
             return
         name = module.__name__
+        patched = []
         if name in SCHEDULER_MODULES:
             for obj in tuple(vars(module).values()):
                 if inspect.isclass(obj) and obj.__module__ == name and "schedule" in vars(obj):
-                    self.patch_method(obj, "schedule", self.wrap_schedule)
+                    if self.patch_method(obj, "schedule", self.wrap_schedule):
+                        patched.append(f"{obj.__name__}.schedule")
         elif name in RUNNER_MODULES:
             runner = module.NPUModelRunner
-            self.patch_method(runner, "execute_model", self.wrap_runner)
-            self.patch_method(runner, "sample_tokens", lambda fn: self.wrap_runner(fn, sampling=True))
+            if self.patch_method(runner, "execute_model", self.wrap_runner):
+                patched.append("NPUModelRunner.execute_model")
+            if self.patch_method(runner, "sample_tokens", lambda fn: self.wrap_runner(fn, sampling=True)):
+                patched.append("NPUModelRunner.sample_tokens")
             for method in STAGE_METHODS:
-                self.patch_method(runner, method, lambda fn, method=method: self.wrap_stage(fn, f"runner.{method}"))
+                if self.patch_method(runner, method, lambda fn, method=method: self.wrap_stage(fn, f"runner.{method}")):
+                    patched.append(f"NPUModelRunner.{method}")
         elif name == "vllm.v1.engine.async_llm":
-            self.patch_method(module.AsyncLLM, "add_request", self.wrap_add_request)
+            if self.patch_method(module.AsyncLLM, "add_request", self.wrap_add_request):
+                patched.append("AsyncLLM.add_request")
         elif name == "vllm.entrypoints.openai.api_server":
 
             def wrap_build(original):
@@ -312,7 +326,9 @@ class Runtime:
 
                 return build_app
 
-            self.patch_method(module, "build_app", wrap_build)
+            if self.patch_method(module, "build_app", wrap_build):
+                patched.append("build_app")
+        self.log(f"module={name} patched={','.join(patched) if patched else 'none'}")
 
     def install(self):
         if any(isinstance(finder, HookFinder) for finder in sys.meta_path):
@@ -324,6 +340,10 @@ class Runtime:
             "vllm.entrypoints.openai.api_server",
         )
         sys.meta_path.insert(0, HookFinder(self, frozenset(modules)))
+        self.log(
+            f"installed port={self.config.collector_port} sample_rate={self.config.sample_rate} "
+            f"every_n_steps={self.config.every_n_steps}"
+        )
         for name in modules:
             if name in sys.modules:
                 self.safe(self.patch_module, sys.modules[name])
@@ -375,6 +395,7 @@ class RequestMiddleware:
         incoming = parse_traceparent(headers.get(b"traceparent", b"").decode("ascii", errors="ignore"))
         context = incoming or {"trace_id": uuid.uuid4().hex, "parent_span_id": None, "sampled": True}
         sampled = selected(context, self.runtime.config.sample_rate)
+        self.runtime.log(f"request trace_id={context['trace_id']} sampled={str(sampled).lower()}")
         span_id = uuid.uuid4().hex[:16]
         traceparent = f"00-{context['trace_id']}-{span_id}-{'01' if sampled else '00'}"
         origin, clock = time.time_ns(), time.perf_counter_ns()

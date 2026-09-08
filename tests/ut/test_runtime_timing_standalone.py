@@ -244,6 +244,13 @@ class TestTracing(unittest.TestCase):
         self.assertIn("[timing-send] sent packet=1", stream.getvalue())
         self.assertIn("names=stage", stream.getvalue())
 
+    def test_probe_diagnostic_log_reports_lifecycle(self):
+        runtime = Runtime(Config(diagnostic_log=True), self.collector)
+        stream = io.StringIO()
+        with contextlib.redirect_stderr(stream):
+            runtime.log("installed port=18765")
+        self.assertIn("[timing-probe] installed port=18765", stream.getvalue())
+
     def test_receiver_diagnostic_log_is_separate_from_json_output(self):
         sink = Mock()
         collector = Collector(0, sink, diagnostic_log=True)
