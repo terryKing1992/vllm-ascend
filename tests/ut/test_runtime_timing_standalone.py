@@ -393,6 +393,20 @@ class TestTracing(unittest.TestCase):
         wrapped = self.runtime.wrap_trace_headers(original)
         self.assertIsNone(asyncio.run(wrapped(None, {"traceparent": "invalid"})))
 
+    def test_vllm_023_base_serving_trace_header_method_is_patched(self):
+        module_name = "vllm.entrypoints.openai.engine.serving"
+
+        class BaseServing:
+            async def _get_trace_headers(self, headers):
+                return None
+
+        BaseServing.__module__ = module_name
+        module = SimpleNamespace(__name__=module_name, BaseServing=BaseServing)
+        runtime = Runtime(Config(sample_rate=1), self.collector)
+        runtime.patch_module(module)
+        headers = {"traceparent": f"00-{TRACE_ID}-{PARENT_ID}-01"}
+        self.assertEqual(asyncio.run(BaseServing()._get_trace_headers(headers)), headers)
+
     def test_decoder_rejects_malformed_packets(self):
         packet = Packet(tuple(self.carrier()["contexts"]), [Record("stage", 1, 2)])
         data = json.dumps(asdict(packet)).encode()

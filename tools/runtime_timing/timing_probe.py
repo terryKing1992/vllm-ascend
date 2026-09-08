@@ -39,6 +39,7 @@ SCHEDULER_MODULES = (
 )
 RUNNER_MODULES = ("vllm_ascend.worker.model_runner_v1", "vllm_ascend.worker.v2.model_runner")
 TRACE_HEADER_MODULES = (
+    "vllm.entrypoints.openai.engine.serving",
     "vllm.entrypoints.generate.base.serving",
     "vllm.entrypoints.pooling.base.serving",
 )

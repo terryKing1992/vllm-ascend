@@ -263,6 +263,12 @@ vLLM 0.23 默认会在自身 OpenTelemetry tracing 未启用时打印
 本工具会在生成和 pooling 请求入口提前提取有效的 `traceparent/tracestate`，此时应看到
 `[timing-probe] trace_headers ...`，随后看到 `engine_request`。无需启用 vLLM profiler 或 OTLP tracing。
 
+vLLM 0.23.0 的生成请求实现位于 `vllm.entrypoints.openai.engine.serving.BaseServing`，正常启动日志应包含：
+
+```text
+[timing-probe] module=vllm.entrypoints.openai.engine.serving patched=BaseServing._get_trace_headers
+```
+
 `traceparent` 最后两位为 `00` 时，上游明确禁止采样；联调时使用 `01`。同时确认新注入目录使用 `sample_rate=1`。
 
 ## 8. 有 request，但没有 timing-send
