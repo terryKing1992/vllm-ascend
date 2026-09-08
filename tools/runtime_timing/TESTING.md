@@ -2,6 +2,8 @@
 
 本文用于验证三个目标：耗时记录能够从模型进程送达 collector、记录能够按请求关联，以及观测组件故障时模型服务仍然可用。
 
+如果预期日志没有出现或 `timing.jsonl` 为空，请使用 [TROUBLESHOOTING.md](TROUBLESHOOTING.md)。
+
 ## 工作原理
 
 `run.py` 不启动模型，也不收集数据。它生成一个固定的注入目录，其中的 `sitecustomize.py` 会在 Python 进程启动时自动加载打点模块。模型服务通过 `PYTHONPATH` 加载该目录后，打点模块会在目标 vLLM 模块导入时包装调度和执行方法。
