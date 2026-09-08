@@ -256,18 +256,27 @@ class Runtime:
         return run
 
     def request_arguments(self, signature, args, kwargs):
-        context = self.request.get()
-        if context is None or "trace_headers" not in signature.parameters:
+        if "trace_headers" not in signature.parameters:
             return args, kwargs
         bound = signature.bind(*args, **kwargs)
         headers = dict(bound.arguments.get("trace_headers") or {})
-        headers["traceparent"] = context["traceparent"]
-        bound.arguments["trace_headers"] = headers
-        prompt = bound.arguments.get("prompt")
-        if hasattr(prompt, "trace_headers"):
-            prompt = copy.copy(prompt)
-            prompt.trace_headers = headers
-            bound.arguments["prompt"] = prompt
+        context = self.request.get()
+        if context is not None:
+            headers["traceparent"] = context["traceparent"]
+            bound.arguments["trace_headers"] = headers
+            prompt = bound.arguments.get("prompt")
+            if hasattr(prompt, "trace_headers"):
+                prompt = copy.copy(prompt)
+                prompt.trace_headers = headers
+                bound.arguments["prompt"] = prompt
+        trace_context = parse_traceparent(headers.get("traceparent"))
+        if trace_context is not None:
+            request_id = str(bound.arguments.get("request_id", ""))[:256]
+            sampled = selected(trace_context, self.config.sample_rate)
+            self.log(
+                f"engine_request request_id={request_id} trace_id={trace_context['trace_id']} "
+                f"sampled={str(sampled).lower()}"
+            )
         return bound.args, bound.kwargs
 
     def wrap_add_request(self, original):

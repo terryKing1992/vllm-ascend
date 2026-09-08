@@ -351,6 +351,22 @@ class TestTracing(unittest.TestCase):
         with patch.object(self.runtime, "request_arguments", side_effect=RuntimeError("fault")):
             self.assertEqual(asyncio.run(self.runtime.wrap_add_request(original)(3)), (3, None))
 
+    def test_add_request_logs_existing_trace_context_without_http_middleware(self):
+        runtime = Runtime(Config(sample_rate=1, diagnostic_log=True), self.collector)
+
+        async def original(owner, request_id, prompt, trace_headers=None):
+            return trace_headers
+
+        stream = io.StringIO()
+        headers = {"traceparent": f"00-{TRACE_ID}-{PARENT_ID}-01"}
+        with contextlib.redirect_stderr(stream):
+            result = asyncio.run(runtime.wrap_add_request(original)(None, "request-1", {}, headers))
+        self.assertIs(result, headers)
+        self.assertIn(
+            f"[timing-probe] engine_request request_id=request-1 trace_id={TRACE_ID} sampled=true",
+            stream.getvalue(),
+        )
+
     def test_decoder_rejects_malformed_packets(self):
         packet = Packet(tuple(self.carrier()["contexts"]), [Record("stage", 1, 2)])
         data = json.dumps(asdict(packet)).encode()
