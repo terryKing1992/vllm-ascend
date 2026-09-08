@@ -12,8 +12,10 @@ MAX_REQUESTS = 8
 
 @dataclass
 class Record:
-    name: str
-    start_ns: int
+    # Defaults keep these transport-only objects acceptable to torch.compile's
+    # dataclass handling when a wrapped runner method is captured.
+    name: str = ""
+    start_ns: int = 0
     end_ns: int = 0
     parent: int | None = None
     span_id: str | None = None
@@ -23,8 +25,8 @@ class Record:
 
 @dataclass
 class Packet:
-    contexts: tuple
-    records: list[Record]
+    contexts: tuple = ()
+    records: list[Record] = field(default_factory=list)
     metadata: dict = field(default_factory=dict)
 
 

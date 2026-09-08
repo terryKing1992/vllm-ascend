@@ -47,6 +47,12 @@ class TestTracing(unittest.TestCase):
         self.collector = MemoryCollector()
         self.runtime = Runtime(Config(sample_rate=1, every_n_steps=1), self.collector)
 
+    def test_transport_dataclasses_have_no_required_fields(self):
+        self.assertEqual(Record().name, "")
+        self.assertEqual(Record().start_ns, 0)
+        self.assertEqual(Packet().contexts, ())
+        self.assertEqual(Packet().records, [])
+
     def request(self, trace_id=TRACE_ID):
         return SimpleNamespace(trace_headers={"traceparent": f"00-{trace_id}-{PARENT_ID}-01"}, num_output_tokens=0)
 
