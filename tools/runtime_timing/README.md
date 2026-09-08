@@ -1,5 +1,19 @@
 # 以模型服务可用性为优先的 Langfuse 打点
 
+**暂未安装 Langfuse 时，collector 默认输出 JSON 日志，不需要 SDK 或密钥。**
+完成下面第 1、2 步的注入和服务启动后，在另一个终端执行：
+
+```bash
+python tools/runtime_timing/collector.py --output log --port 18765 > timing.jsonl
+```
+
+省略 `--output log` 也是日志模式。不加重定向则直接显示在 collector 终端。
+每行一个阶段记录，包含 `name`、`trace_id`、`span_id`、`parent_span_id`、`request_id`、
+`duration_ms`、来源 PID 和 batch 元数据；开始/结束时间保留为 Unix 纳秒。
+进程启动和故障提示写 stderr，stdout 只输出 JSON 数据。
+日志写在独立 collector 中，日志管道堵塞时由有界队列丢弃新数据，模型不会等待日志写入。
+日志文件容量和轮转由部署方的日志收集器管理。
+
 设计目标是：**collector、网络、认证、SDK 或普通打点异常发生时，丢弃观测数据，继续业务执行。**
 这不是“绝对零影响”的承诺：进程内 Python wrapper 仍消耗 CPU、内存，也无法隔离解释器崩溃、系统级 OOM 或任意死锁。
 NPU 实机性能和故障场景仍需验收。
@@ -22,7 +36,7 @@ run.py 只在部署前生成固定的注入目录，生成后退出；不再作�
 | 位置 | 运行内容 | 依赖 |
 | --- | --- | --- |
 | 模型进程 | 少数函数 wrapper、时间戳、本机 UDP 发送 | Python 标准库 |
-| collector 进程 | 有界队列、Langfuse v3 SDK、网络请求和重试 | 独立 Python 环境及 SDK |
+| collector 进程 | 有界队列、JSON 日志或 Langfuse 上报 | 日志模式仅标准库；Langfuse 模式需独立 SDK 环境 |
 | 部署工具 run.py | 生成固定注入文件 | Python 标准库；不需要服务器密钥 |
 
 模型进程中不导入 Langfuse / OpenTelemetry，不创建上报线程，不执行 DNS、远程 HTTP、文件落盘、日志打印或退出 flush。
@@ -63,6 +77,8 @@ Python -S / -I 会跳过这种注入；直接运行 api_server 的 __main__ 方�
 
 ## 3. 独立启动 collector
 
+默认日志模式使用开头的命令即可。以下步骤仅在准备切换到 Langfuse 时执行，模型侧配置不需要改变。
+
 建议在另一个 Python 虚拟环境安装依赖，避免改变模型环境的 SDK 版本：
 
 ```bash
@@ -74,7 +90,7 @@ export LANGFUSE_BASE_URL='https://your-langfuse-server'
 export LANGFUSE_PUBLIC_KEY='pk-lf-...'
 export LANGFUSE_SECRET_KEY='sk-lf-...'
 
-./observe-venv/bin/python tools/runtime_timing/collector.py --port 18765
+./observe-venv/bin/python tools/runtime_timing/collector.py --port 18765 --output langfuse
 ```
 
 collector 可以晚于模型启动，也可以单独停止、重启。离线期间的数据丢失，不补发历史数据。
@@ -179,7 +195,7 @@ collector 的接收队列默认 256 包，满时丢新包；SDK 也使用有界�
 UDP 不保证送达：模型端 sent 仅代表本机内核接受，collector 无法统计所有在途丢失。
 collector 退出时报告 received、invalid、dropped；网络导出的错误由 collector 的 SDK 日志报告。
 
-仅停止 collector 即可停止向 Langfuse 上传，但模型仍会做采样计时。
+仅停止 collector 即可停止日志输出或向 Langfuse 上传，但模型仍会做采样计时。
 彻底关闭：从模型启动环境移除注入 PYTHONPATH，按原部署流程重启。
 也可以部署 sample-rate=0 的新目录，或移除 enabled 标记后重启。
 enabled 只在进程启动时读取，不是运行中的热开关。不要在热路径反复读配置文件。

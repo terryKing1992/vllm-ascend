@@ -1,1 +1,2 @@
+# Only needed for collector --output langfuse. Log mode uses the standard library.
 langfuse>=3.10,<4

@@ -6,8 +6,9 @@ import math
 import os
 import signal
 import socket
+import sys
 
-from trace_export import BufferedExporter, CollectorConfig
+from trace_export import BufferedExporter, CollectorConfig, JsonLogSink, LangfuseSink
 from trace_transport import MAX_DATAGRAM_BYTES, decode_packet
 
 
@@ -47,6 +48,7 @@ class Collector:
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output", choices=("log", "langfuse"), default="log")
     parser.add_argument("--port", type=int, default=18765)
     parser.add_argument("--queue-size", type=int, default=256)
     parser.add_argument("--flush-at", type=int, default=256)
@@ -56,22 +58,24 @@ def main():
         parser.error("invalid port or queue/batch limits")
     if not math.isfinite(args.flush_interval) or args.flush_interval <= 0:
         parser.error("flush-interval must be positive and finite")
-    try:
-        if importlib.metadata.version("langfuse").split(".")[0] != "3":
-            parser.error("collector requires Langfuse SDK v3")
-    except importlib.metadata.PackageNotFoundError:
-        parser.error("install requirements.txt in the collector environment")
-    if not all(os.environ.get(key) for key in ("LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY")):
-        parser.error("configure Langfuse credentials in the collector environment only")
-    if not (os.environ.get("LANGFUSE_BASE_URL") or os.environ.get("LANGFUSE_HOST")):
-        parser.error("set LANGFUSE_BASE_URL to your server")
-    exporter = BufferedExporter(CollectorConfig(args.queue_size, args.flush_at, args.flush_interval))
+    if args.output == "langfuse":
+        try:
+            if importlib.metadata.version("langfuse").split(".")[0] != "3":
+                parser.error("collector requires Langfuse SDK v3")
+        except importlib.metadata.PackageNotFoundError:
+            parser.error("install requirements.txt in the collector environment")
+        if not all(os.environ.get(key) for key in ("LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY")):
+            parser.error("configure Langfuse credentials in the collector environment only")
+        if not (os.environ.get("LANGFUSE_BASE_URL") or os.environ.get("LANGFUSE_HOST")):
+            parser.error("set LANGFUSE_BASE_URL to your server")
+    sink_factory = JsonLogSink if args.output == "log" else LangfuseSink
+    exporter = BufferedExporter(CollectorConfig(args.queue_size, args.flush_at, args.flush_interval), sink_factory)
     collector = Collector(args.port, exporter)
     signal.signal(signal.SIGTERM, collector.stop)
     signal.signal(signal.SIGINT, collector.stop)
-    print(f"Collector listening on 127.0.0.1:{args.port}", flush=True)
+    print(f"Collector listening on 127.0.0.1:{args.port}, output={args.output}", file=sys.stderr, flush=True)
     collector.run()
-    print(f"received={collector.received} invalid={collector.invalid} dropped={exporter.dropped}")
+    print(f"received={collector.received} invalid={collector.invalid} dropped={exporter.dropped}", file=sys.stderr)
 
 
 if __name__ == "__main__":

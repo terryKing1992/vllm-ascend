@@ -2,6 +2,7 @@
 
 import asyncio
 import contextlib
+import importlib.util
 import io
 import json
 import os
@@ -26,7 +27,7 @@ if (TOOL_DIR / ".test-deps").is_dir():
 from collector import Collector  # noqa: E402
 from run import prepare  # noqa: E402
 from timing_probe import Config, RequestMiddleware, Runtime, parse_traceparent, selected  # noqa: E402
-from trace_export import BufferedExporter, CollectorConfig, LangfuseSink  # noqa: E402
+from trace_export import BufferedExporter, CollectorConfig, JsonLogSink, LangfuseSink  # noqa: E402
 from trace_transport import DatagramEmitter, Packet, Record, decode_packet  # noqa: E402
 
 TRACE_ID = "12345678901234567890123456789012"
@@ -51,6 +52,51 @@ class TestTracing(unittest.TestCase):
 
     def carrier(self):
         return {"contexts": [parse_traceparent(f"00-{TRACE_ID}-{PARENT_ID}-01")], "metadata": {}}
+
+    def test_json_log_keeps_trace_parentage_and_duration(self):
+        stream = io.StringIO()
+        sink = JsonLogSink(CollectorConfig(), stream)
+        contexts = tuple(self.carrier()["contexts"])
+        sink.emit(
+            Packet(
+                contexts,
+                [Record("execute", 1000, 3000, span_id="a" * 16), Record("prepare", 1500, 2500, parent=0)],
+                {"source_pid": 123},
+            )
+        )
+        sink.close()
+        root, child = [json.loads(line) for line in stream.getvalue().splitlines()]
+        self.assertEqual(root["trace_id"], TRACE_ID)
+        self.assertEqual(root["parent_span_id"], PARENT_ID)
+        self.assertEqual(child["parent_span_id"], root["span_id"])
+        self.assertEqual(child["duration_ms"], 0.001)
+        self.assertEqual(child["pid"], 123)
+
+    def test_log_collector_starts_and_outputs_without_site_packages(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as reservation:
+            reservation.bind(("127.0.0.1", 0))
+            port = reservation.getsockname()[1]
+        process = subprocess.Popen(
+            [sys.executable, "-S", str(TOOL_DIR / "collector.py"), "--port", str(port)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        emitter = DatagramEmitter(port)
+        try:
+            self.assertIn("output=log", process.stderr.readline())
+            emitter.submit(Packet(tuple(self.carrier()["contexts"]), [Record("execute", 1, 2)]))
+            lines = []
+            reader = threading.Thread(target=lambda: lines.append(process.stdout.readline()), daemon=True)
+            reader.start()
+            reader.join(timeout=5)
+            self.assertFalse(reader.is_alive(), "collector must flush log packets")
+            self.assertEqual(json.loads(lines[0])["trace_id"], TRACE_ID)
+        finally:
+            process.terminate()
+            process.communicate(timeout=5)
+            if emitter.socket is not None:
+                emitter.socket.close()
 
     def test_trace_validation_and_sampling(self):
         self.assertIsNone(parse_traceparent("invalid"))
@@ -403,6 +449,7 @@ class TestTracing(unittest.TestCase):
                 exporter.close()
         self.assertGreater(exporter.failed, 0)
 
+    @unittest.skipUnless(importlib.util.find_spec("langfuse"), "optional Langfuse SDK is not installed")
     def test_real_sdk_timestamps_and_trace_ids_without_network(self):
         from opentelemetry.sdk.trace.export import SimpleSpanProcessor
         from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter

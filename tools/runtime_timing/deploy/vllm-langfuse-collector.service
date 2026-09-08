@@ -5,8 +5,9 @@ Description=Optional vLLM Langfuse collector
 Type=simple
 # Example paths: adapt to the collector installation, not the model environment.
 WorkingDirectory=/opt/ascend-observe
-EnvironmentFile=/etc/vllm-langfuse.env
-ExecStart=/opt/observe-venv/bin/python /opt/ascend-observe/collector.py --port 18765
+EnvironmentFile=-/etc/vllm-langfuse.env
+# Default log mode needs no SDK or credentials. Change to --output langfuse when ready.
+ExecStart=/usr/bin/python3 /opt/ascend-observe/collector.py --port 18765 --output log
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=15

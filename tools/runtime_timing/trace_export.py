@@ -1,4 +1,4 @@
-"""Collector-only Langfuse v3 export. Never imported by the model service."""
+"""Collector-only JSON logging or Langfuse v3 export."""
 
 import atexit
 import json
@@ -8,6 +8,7 @@ import socket
 import sys
 import threading
 import time
+import uuid
 from contextlib import suppress
 from dataclasses import dataclass
 
@@ -17,6 +18,40 @@ class CollectorConfig:
     queue_size: int = 256
     flush_at: int = 256
     flush_interval: float = 2.0
+
+
+class JsonLogSink:
+    def __init__(self, config, stream=None):
+        self.stream = stream if stream is not None else sys.stdout
+        self.host = socket.gethostname()
+
+    def emit(self, packet):
+        for request in packet.contexts:
+            span_ids = {}
+            for index, record in enumerate(packet.records):
+                span_id = record.span_id or uuid.uuid4().hex[:16]
+                parent_id = span_ids.get(record.parent, request.get("parent_span_id"))
+                span_ids[index] = span_id
+                event = {
+                    "name": record.name,
+                    "trace_id": request["trace_id"],
+                    "span_id": span_id,
+                    "parent_span_id": parent_id,
+                    "request_id": request.get("request_id", ""),
+                    "start_ns": record.start_ns,
+                    "end_ns": record.end_ns,
+                    "duration_ms": (record.end_ns - record.start_ns) / 1_000_000,
+                    "timing_kind": "host_wall_inclusive",
+                    "error": record.error,
+                    "host": self.host,
+                    "pid": packet.metadata.get("source_pid"),
+                    "metadata": {**packet.metadata, **request.get("metadata", {}), **record.metadata},
+                }
+                self.stream.write(json.dumps(event, ensure_ascii=False, allow_nan=False) + "\n")
+        self.stream.flush()
+
+    def close(self):
+        self.stream.flush()
 
 
 class LangfuseSink:
