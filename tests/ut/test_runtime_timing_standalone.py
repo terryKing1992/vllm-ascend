@@ -373,7 +373,11 @@ class TestTracing(unittest.TestCase):
 
     def test_trace_headers_survive_when_vllm_tracing_is_disabled(self):
         runtime = Runtime(Config(sample_rate=1, diagnostic_log=True), self.collector)
-        original = Mock(side_effect=AssertionError("valid trace context must not be discarded"))
+        calls = Mock(side_effect=AssertionError("valid trace context must not be discarded"))
+
+        async def original(owner, headers):
+            return calls(owner, headers)
+
         wrapped = runtime.wrap_trace_headers(original)
         headers = {
             "traceparent": f"00-{TRACE_ID}-{PARENT_ID}-01",
@@ -387,7 +391,7 @@ class TestTracing(unittest.TestCase):
             extracted,
             {"traceparent": headers["traceparent"], "tracestate": "vendor=value"},
         )
-        original.assert_not_called()
+        calls.assert_not_called()
         self.assertIn(f"[timing-probe] trace_headers trace_id={TRACE_ID} sampled=true", stream.getvalue())
 
     def test_invalid_trace_headers_keep_vllm_behavior(self):
@@ -491,7 +495,11 @@ class TestTracing(unittest.TestCase):
             (package / "async_llm.py").write_text("BUSINESS_VALUE = 42\n", encoding="utf-8")
             env = os.environ.copy()
             env["PYTHONPATH"] = str(bundle) + os.pathsep + directory
-            script = "from vllm.v1.engine.async_llm import BUSINESS_VALUE; assert BUSINESS_VALUE == 42"
+            script = (
+                "import sys; from timing_probe import HookFinder; "
+                "from vllm.v1.engine.async_llm import BUSINESS_VALUE; assert BUSINESS_VALUE == 42; "
+                "assert not next(f.runtime for f in sys.meta_path if isinstance(f, HookFinder)).disabled"
+            )
             result = subprocess.run([sys.executable, "-c", script], env=env, capture_output=True, timeout=15)
             self.assertEqual(result.returncode, 0, result.stderr)
 
@@ -504,8 +512,8 @@ class TestTracing(unittest.TestCase):
                 (root / "__init__.py").touch()
             (package / "async_llm.py").write_text(
                 "class AsyncLLM:\n"
-                "    async def add_request(self, value, trace_headers=None):\n"
-                "        return value, trace_headers\n",
+                "    async def add_request(self, request_id, prompt, trace_headers=None):\n"
+                "        return prompt, trace_headers\n",
                 encoding="utf-8",
             )
             env = os.environ.copy()
@@ -514,7 +522,7 @@ class TestTracing(unittest.TestCase):
                 "import asyncio,sys,threading; "
                 "from vllm.v1.engine.async_llm import AsyncLLM; "
                 "assert AsyncLLM.add_request._runtime_timing_wrapped; "
-                "assert asyncio.run(AsyncLLM().add_request(7)) == (7,None); "
+                "assert asyncio.run(AsyncLLM().add_request('a',7)) == (7,None); "
                 "assert 'langfuse' not in sys.modules; assert len(threading.enumerate()) == 1"
             )
             result = subprocess.run([sys.executable, "-c", script], env=env, capture_output=True, timeout=15)

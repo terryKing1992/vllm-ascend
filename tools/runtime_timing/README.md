@@ -47,7 +47,7 @@ run.py 只在部署前生成固定的注入目录，生成后退出；不再作�
 | collector 进程 | 有界队列、JSON 日志或 Langfuse 上报 | 日志模式仅标准库；Langfuse 模式需独立 SDK 环境 |
 | 部署工具 run.py | 生成固定注入文件 | Python 标准库；不需要服务器密钥 |
 
-模型进程中不导入 Langfuse / OpenTelemetry，不创建上报线程，不执行 DNS、远程 HTTP、文件落盘、日志打印或退出 flush。
+模型进程中不导入 Langfuse / OpenTelemetry，不创建上报线程，不执行 DNS、远程 HTTP、文件落盘或退出 flush；默认不打印诊断日志，显式开启 `--diagnostic-log` 时会写 stderr。
 非阻塞发送遇到系统缓冲区不足就丢弃，不等待 ACK，不重传。
 JSON 编码仍在模型线程中执行，大小与数量受限；它不是零开销。
 
@@ -86,7 +86,7 @@ PYTHONPATH="$PWD/observe-inject-v1${PYTHONPATH:+:$PYTHONPATH}" \
 
 启动时，sitecustomize 尝试加载可选打点。配置错误、打点文件缺失、依赖加载失败时跳过打点。
 既有 sitecustomize 代码先执行，其自身行为保持原样。
-Python -S / -I 会跳过这种注入；直接运行 api_server 的 __main__ 方式暂不适配，请使用 vllm serve。
+Python -S / -I 会跳过这种注入。支持 `vllm serve`；`python -m vllm.entrypoints.openai.api_server` 通过 `launcher.serve_http` 补装请求中间件，实际注册成功时打印 `middleware_installed`（需开启诊断）。
 
 ## 3. 独立启动 collector
 
@@ -145,7 +145,7 @@ JSON span，重点字段是 `name`、`trace_id`、`request_id`、`duration_ms`�
 
 ## 请求 trace 如何贯通
 
-支持 /v1/chat/completions 和 /v1/completions，包括流式响应。
+支持 /v1/chat/completions、/v1/completions、/v1/responses 和 /v1/embeddings，包括流式响应及 ASGI root_path 前缀。
 上游传入标准 W3C version 00 traceparent：
 
 ```bash

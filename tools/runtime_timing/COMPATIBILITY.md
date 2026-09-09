@@ -1,57 +1,90 @@
 # Runtime Timing 版本兼容说明
 
-本工具不根据版本字符串选择一整套实现，而是在进程启动后监听候选模块，并按实际存在的类和方法安装 wrapper。没有出现的模块不会被主动导入，也不会影响模型启动。
+本工具面向 vLLM 0.23 及以上版本，按实际导入的模块、方法及参数安装打点，不按版本号强制切换实现。模型侧只使用标准库和本机 UDP；collector 可选择 JSONL 日志或 Langfuse v3，二者使用相同的请求关联信息。
 
-## 当前能力探测
+## 已核对的接口
 
-| 能力 | 候选模块或方法 |
-| --- | --- |
-| HTTP 请求根 span | `vllm.entrypoints.openai.api_server.build_app` |
-| 请求头提取（0.23 路径） | `vllm.entrypoints.openai.engine.serving.BaseServing._get_trace_headers` |
-| 请求头提取（较新路径） | `vllm.entrypoints.serve.engine.serving`、`vllm.entrypoints.generate.base.serving` 中实际定义 `_get_trace_headers` 的类 |
-| Pooling 请求头 | `vllm.entrypoints.pooling.base.serving` 中实际定义 `_get_trace_headers` 的类 |
-| 请求进入引擎 | `vllm.v1.engine.async_llm.AsyncLLM.add_request` |
-| 调度 | vLLM v1 scheduler 及 vLLM Ascend 已知 scheduler 的 `schedule` |
-| 模型执行 | vLLM Ascend v1/v2 `NPUModelRunner` 中实际存在的阶段方法 |
-
-同一个类的方法只包装一次。版本新增、删除或移动某个候选模块时，其余能力仍可独立工作；诊断日志会显示实际命中的模块和方法。
-
-## 版本范围
-
-| 版本系列 | 当前状态 | 验证边界 |
+| 官方版本 | 请求头提取入口 | 验证程度 |
 | --- | --- | --- |
-| vLLM 0.23.x | 已加入旧版 `openai.engine.serving` 请求头路径 | 使用 0.23.0 官方源码核对，并有模拟模块与请求链单元测试；仍需目标 NPU 环境联调 |
-| vLLM 0.26.x | 已加入较新的 `serve.engine.serving` 和 `generate.base.serving` 候选路径 | 使用能力探测兼容，实际 dev commit 可能继续变化；仍需目标版本和 NPU 环境联调 |
-| vLLM Ascend runner v1/v2 | 同时监听当前仓库的两个 runner 模块 | 仅包装实际存在的方法；不同分支上的方法差异会反映在 `patched=` 日志中 |
+| [0.23.0](https://github.com/vllm-project/vllm/blob/v0.23.0/vllm/entrypoints/openai/engine/serving.py) | `openai.engine.serving.OpenAIServing` | 官方源码核对、模拟接口跨进程测试 |
+| [0.24.0](https://github.com/vllm-project/vllm/blob/v0.24.0/vllm/entrypoints/openai/engine/serving.py) | `openai.engine.serving.OpenAIServing` | 官方源码核对、模拟接口跨进程测试 |
+| [0.25.0](https://github.com/vllm-project/vllm/blob/v0.25.0/vllm/entrypoints/generate/base/serving.py) | `generate.base.serving.GenerateBaseServing` | 官方源码核对、模拟接口跨进程测试 |
+| [0.26.0](https://github.com/vllm-project/vllm/blob/v0.26.0/vllm/entrypoints/generate/base/serving.py) | `generate.base.serving.GenerateBaseServing` | 官方源码核对、模拟接口跨进程测试 |
 
-开发版版本号通常包含 `.dev` 和 Git SHA。排障或报告结果时必须保存完整版本，不能只记录 `0.23.1` 或 `0.26.1`。
+这些版本的 `AsyncLLM.add_request` 都接受 `request_id`、`prompt`、`trace_headers`，`SchedulerOutput` 是允许附加属性的 dataclass。测试覆盖 Ascend v1/v2 runner 的两种模块布局。**上述测试使用模拟 vLLM 接口，不表示已在四套真实 vLLM/NPU 环境运行模型。**
+
+0.23.1、其他补丁版、开发版及更高版本如果保留这些接口，会使用同一套打点；接口迁移到未知模块或改变调用约定时，需要继续适配，不能保证所有未来版本自动兼容。升级验收以目标环境的实际请求数据为准。
+
+## 适配方式
+
+| 能力 | 实现与降级 |
+| --- | --- |
+| 请求根 span | 在 `openai.api_server.build_app` 注册 ASGI 中间件；`entrypoints.launcher.serve_http` 再检查并补装，覆盖通过 `python -m ...api_server` 启动的情况；同一个 app 只安装一次 |
+| 请求路径 | `/v1/chat/completions`、`/v1/completions`、`/v1/responses`、`/v1/embeddings`；支持流式响应和 ASGI `root_path` 前缀 |
+| Trace 提取 | 同时监听旧版 OpenAI、新版生成及 pooling 模块中实际定义的 `_get_trace_headers`；保留标准 trace 头，无须启用 vLLM 自带 OTLP tracing |
+| 引擎关联 | 按函数签名绑定参数，传递请求根 span 的 `traceparent`；输入已经是携带 `trace_headers` 的请求对象时，浅复制后更新，保留调用者原对象 |
+| 调度与 worker | 调度器附加普通字典到 `SchedulerOutput`；worker 恢复关联并记录实际存在的方法。自定义 executor 若丢弃额外属性，worker 将没有关联数据 |
+| 未知接口 | 缺少类、方法、签名不匹配或 wrapper 安装失败时跳过该目标，其他打点继续工作 |
+| 运行期故障 | 普通打点执行异常仍会关闭当前进程的观测以保留业务执行；诊断模式输出 `disabled operation=... error=...`，不打印异常文本 |
+
+采集的是 Python 方法的 Host 耗时，批次执行时间标记为 `shared_batch_time=true`，不能解释成单请求独占 NPU 时间。没有使用 profiler 或强制 NPU 同步。
+
+## 升级后必须重新生成注入目录
+
+`run.py` 把代码复制到固定目录。更新 Git 工作区不会更新旧目录，也不会更新已经运行的模型进程。
+
+在 Linux 模型环境中执行，目录名必须尚不存在：
+
+```bash
+INJECT_DIR="$PWD/observe-inject-compat-v2"
+python tools/runtime_timing/run.py \
+  --output-dir "$INJECT_DIR" \
+  --sample-rate 1 --every-n-steps 1 \
+  --collector-port 18765 --diagnostic-log
+
+export PYTHONPATH="$INJECT_DIR${PYTHONPATH:+:$PYTHONPATH}"
+python -c "import timing_probe; print(timing_probe.__file__)"
+```
+
+最后一条应打印新目录中的 `timing_probe.py`。随后用当前环境和原有模型启动参数重启服务，收集 stderr。所有 API、scheduler、worker 进程必须加载新目录，多节点部署需要逐节点配置。
+
+collector 暂时使用日志模式即可，在独立终端、同一网络命名空间启动：
+
+```bash
+python tools/runtime_timing/collector.py --port 18765 --output log \
+  --diagnostic-log > timing.jsonl 2> timing-collector.log
+```
+
+按 [TESTING.md](TESTING.md) 发送固定 Trace ID 的请求，等待响应完成，然后检查模型日志和结果。不要只看到 `patched=` 就认为上报成功。
+
+| 日志 | 能确认什么 |
+| --- | --- |
+| `middleware_installed` | 请求中间件已注册到实际 app |
+| `request ... sampled=true` | HTTP 请求命中中间件并被采样 |
+| `engine_request ... trace_id=...` | 请求关联信息已经到达 AsyncLLM |
+| `engine_request trace_context=missing` | 引擎入口命中，但无有效 trace；先检查中间件和请求入口 |
+| `scheduler_active ... contexts=...` | 第一次调度观察结果；可能来自空批次，只打印一次 |
+| `runner_active carrier=...` | 第一次执行观察结果；可能来自预热，只打印一次 |
+| `patch_skipped ...` | 指定接口缺失、不支持或安装失败；其他能力仍可工作 |
+| `patch_existing ...` | 已经包装，避免重复打点；此时模块的 `patched=none` 不代表失败 |
+| `carrier_unsupported` | 无法给调度输出附加关联信息；保留调度记录，worker 关联不可用 |
+| `disabled operation=...` | 当前进程发生了运行期打点故障，后续观测已停止 |
+| `timing-send` / `timing-recv` | 分别表示本机发送尝试成功和 collector 收到数据；发送成功不是送达确认 |
+
+这些诊断需要生成目录时开启 `--diagnostic-log`，写到相应进程的 stderr；诊断日志本身可能阻塞，生产验收后应重新生成关闭诊断、降低采样率的目录。
+
+最终应在 `timing.jsonl` 的同一个 `trace_id` 下找到 `vllm.request`、`scheduler.schedule`、`runner.execute_model`，通常还有采样和准备输入阶段。请求根 span 在响应结束后才发送。Langfuse v3 模式继续使用相同的 trace ID 和 parent span ID，安装及切换步骤见 [README.md](README.md)。
+
+## 无硬件回归测试
+
+```bash
+python -m unittest discover -s tests/ut -p 'test_runtime_timing*.py' -v
+```
+
+新增兼容测试会启动独立 API 与 worker 子进程，通过真实 import hook、pickle、UDP 和 JSONL 验证请求关联，覆盖旧/新请求模块、普通导入/`-m` 启动、v1/v2 runner，以及接口缺失时的降级。它不使用已安装的 vLLM，不测试设备执行。Langfuse SDK 不存在时仅跳过 SDK 专用测试。
+
+真实服务验收仍须执行 [TESTING.md](TESTING.md) 的请求、collector 故障与性能对比步骤。记录完整版本及开发提交：
 
 ```bash
 python -c "import importlib.metadata as m; print('vllm=', m.version('vllm')); print('vllm-ascend=', m.version('vllm-ascend'))"
 ```
-
-启用 `--diagnostic-log` 后，`installed` 日志也会打印两个完整版本：
-
-```text
-[timing-probe] installed ... vllm=0.23.1.dev... vllm_ascend=0.23.1.dev...
-```
-
-随后检查能力命中情况：
-
-```bash
-grep '\[timing-probe\].*patched=' /path/to/vllm-service.log
-```
-
-至少应看到与当前部署对应的请求头模块、`AsyncLLM.add_request`、scheduler 和 runner。模块显示 `patched=none` 表示模块存在但预期方法不存在；完全没有某个候选模块的日志通常表示该版本没有导入它，这是正常的，只需确认同一能力的另一个候选模块已命中。
-
-## 新版本适配原则
-
-升级 vLLM 或 vLLM Ascend 时，先用采样率 1、步频 1 和诊断日志生成全新注入目录，再运行 `TESTING.md` 的固定 Trace ID 请求。验收以下链路：
-
-```text
-trace_headers → engine_request → scheduler.schedule → runner.execute_model → timing-recv
-```
-
-如果链路在某一层中断，使用 `TROUBLESHOOTING.md` 保存完整版本和 `patched=` 日志。只有类或方法确实迁移后才增加候选模块；不要仅凭版本号分支复制整套逻辑。
-
-兼容单元测试不等于 NPU 实机验证。每次版本升级仍应比较请求正确性、成功率、TTFT、TPOT、吞吐以及 collector 故障时的服务可用性。

@@ -2,15 +2,21 @@
 
 本文用于排查没有 `[timing-probe]`、`[timing-send]`、`[timing-recv]` 或 `timing.jsonl` 为空的问题。按照日志出现的位置逐层检查，不要跳过注入验证。
 
+vLLM 0.23 及以上的接口与升级步骤见 [COMPATIBILITY.md](COMPATIBILITY.md)。特别注意：拉取代码后必须重新生成注入目录并重启服务；`PYTHONPATH` 指向旧目录时仍运行旧打点。
+
 ## 日志分别代表什么
 
 | 日志 | 所在进程 | 含义 |
 | --- | --- | --- |
 | `[timing-probe] installed` | 模型进程 | Python 已加载注入目录并安装 import hook |
 | `[timing-probe] module=... patched=...` | 模型进程 | 目标 vLLM 模块已导入，并完成方法包装 |
+| `[timing-probe] middleware_installed` | API 进程 | 中间件已经注册到实际 app；`build_app` 被包装本身不代表注册成功 |
+| `[timing-probe] patch_skipped ...` | 模型进程 | 单个接口不兼容或缺失，其他打点继续工作 |
+| `[timing-probe] disabled operation=...` | 模型进程 | 运行期打点发生异常，当前进程的后续观测关闭；按 operation 定位 |
+| `[timing-probe] engine_request trace_context=missing` | API 进程 | 引擎已收到请求，但关联信息缺失；检查请求中间件和实际路由 |
 | `[timing-probe] request ... sampled=true` | API 进程 | 请求已进入中间件并被采样 |
 | `[timing-probe] engine_request ...` | AsyncLLM 进程 | `add_request` 已收到有效 `traceparent`；可作为 HTTP 中间件未命中时的兼容诊断 |
-| `[timing-probe] trace_headers ...` | API 进程 | vLLM 0.23 已提取请求头并将其继续传给 AsyncLLM |
+| `[timing-probe] trace_headers ...` | API 进程 | 旧版或新版请求入口已提取关联信息并将其继续传给 AsyncLLM |
 | `[timing-send] sent ...` | 模型或 worker 进程 | UDP 包已交给本机内核 |
 | `[timing-recv] received ...` | collector 进程 | UDP 包已收到并成功解析 |
 | JSON 行 | `timing.jsonl` | collector 已把一个阶段写入结果文件 |
@@ -219,7 +225,7 @@ grep '\[timing-probe\]' /path/to/vllm-service.log | tail -50
 [timing-probe] module=vllm_ascend.worker.model_runner_v1 patched=...
 ```
 
-出现 `patched=none` 表示模块名称匹配，但当前 vLLM 版本的类或方法结构不同。保存完整的 `module=... patched=none` 日志，并记录版本：
+出现 `patched=none` 表示本次没有新增 wrapper，可能是已包装（`patch_existing`），也可能是类或方法结构不同（`patch_skipped`）。保存这些日志，并记录版本：
 
 ```bash
 python -c "import importlib.metadata as m; print('vllm=', m.version('vllm')); print('vllm-ascend=', m.version('vllm-ascend'))"
@@ -263,10 +269,10 @@ vLLM 0.23 默认会在自身 OpenTelemetry tracing 未启用时打印
 本工具会在生成和 pooling 请求入口提前提取有效的 `traceparent/tracestate`，此时应看到
 `[timing-probe] trace_headers ...`，随后看到 `engine_request`。无需启用 vLLM profiler 或 OTLP tracing。
 
-vLLM 0.23.0 的生成请求实现位于 `vllm.entrypoints.openai.engine.serving.BaseServing`，正常启动日志应包含：
+vLLM 0.23.0 的生成请求实现位于 `vllm.entrypoints.openai.engine.serving.OpenAIServing`，正常启动日志应包含：
 
 ```text
-[timing-probe] module=vllm.entrypoints.openai.engine.serving patched=BaseServing._get_trace_headers
+[timing-probe] module=vllm.entrypoints.openai.engine.serving patched=OpenAIServing._get_trace_headers
 ```
 
 `traceparent` 最后两位为 `00` 时，上游明确禁止采样；联调时使用 `01`。同时确认新注入目录使用 `sample_rate=1`。

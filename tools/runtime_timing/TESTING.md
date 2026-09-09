@@ -4,6 +4,16 @@
 
 如果预期日志没有出现或 `timing.jsonl` 为空，请使用 [TROUBLESHOOTING.md](TROUBLESHOOTING.md)。
 
+vLLM 0.23 及以上版本的接口核对范围、新注入目录生成方法与诊断含义见 [COMPATIBILITY.md](COMPATIBILITY.md)。更新代码后必须重新生成目录并重启相关服务进程；旧目录不会自动更新。
+
+包含兼容测试的完整独立回归命令如下，不需要运行 NPU 测试的 conftest：
+
+```bash
+python -m unittest discover -s tests/ut -p 'test_runtime_timing*.py' -v
+```
+
+兼容测试中的 API/worker 使用模拟 vLLM 接口，真实执行跨进程传输和日志输出；通过这些测试后，仍需执行下文的模型实机步骤。
+
 ## 工作原理
 
 `run.py` 不启动模型，也不收集数据。它生成一个固定的注入目录，其中的 `sitecustomize.py` 会在 Python 进程启动时自动加载打点模块。模型服务通过 `PYTHONPATH` 加载该目录后，打点模块会在目标 vLLM 模块导入时包装调度和执行方法。
@@ -146,7 +156,7 @@ PYTHONPATH="$PWD/observe-inject-test${PYTHONPATH:+:$PYTHONPATH}" \
 [timing-probe] module=vllm.entrypoints.openai.api_server patched=build_app
 ```
 
-后续目标模块被导入时还会打印对应的 `module=... patched=...`。出现 `patched=none` 表示该模块存在，但当前版本中没有匹配到预期方法。完全没有 `[timing-probe]` 表示模型没有加载这个注入目录。
+后续目标模块被导入时还会打印对应的 `module=... patched=...`。`patched=none` 表示本次没有新增 wrapper；结合 `patch_existing`（已包装）和 `patch_skipped`（接口缺失或不匹配）判断原因。完全没有 `[timing-probe]` 时，先核对注入目录、诊断配置和 stderr 去向。
 
 ## 6. 发送固定 Trace ID 的请求
 

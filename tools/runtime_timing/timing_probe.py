@@ -5,6 +5,7 @@ import functools
 import importlib.abc
 import importlib.metadata
 import inspect
+import os
 import re
 import sys
 import time
@@ -19,6 +20,8 @@ TRACE_PACKET_ATTR = "_langfuse_runtime_packet"
 PENDING_PACKET_ATTR = "_langfuse_runtime_pending"
 STEP_ATTR = "_langfuse_runtime_step"
 REQUEST_CONTEXT_ATTR = "_langfuse_runtime_context"
+MIDDLEWARE_ATTR = "_langfuse_runtime_middleware"
+HTTP_PATHS = frozenset(("/v1/chat/completions", "/v1/completions", "/v1/responses", "/v1/embeddings"))
 STAGE_METHODS = (
     "_update_states",
     "_prepare_inputs",
@@ -90,21 +93,34 @@ class Runtime:
         self.scheduling = ContextVar("runtime_scheduling", default=False)
         self.disabled = False
         self.failures = 0
+        self.diagnostics = set()
 
     def log(self, message):
         if self.config.diagnostic_log:
             with suppress(Exception):
                 print(f"[timing-probe] {message}", file=sys.stderr, flush=True)
 
+    def log_once(self, key, message):
+        if self.config.diagnostic_log and key not in self.diagnostics:
+            self.diagnostics.add(key)
+            self.log(f"{message} pid={os.getpid()}")
+
     def safe(self, operation, *args):
         """Only instrumentation enters here; never catch/retry business execution."""
         try:
             return operation(*args)
-        except Exception:
-            # No worker logging: stderr itself can block or be broken.
+        except Exception as error:
             self.disabled = True
             self.failures += 1
+            self.log(f"disabled operation={getattr(operation, '__name__', 'unknown')} error={type(error).__name__}")
             return None
+
+    def safe_patch_module(self, module):
+        # An incompatible optional interface must not disable other capabilities.
+        try:
+            self.patch_module(module)
+        except Exception as error:
+            self.log(f"patch_skipped module={module.__name__} error={type(error).__name__}")
 
     def submit(self, packet):
         if not self.disabled:
@@ -160,7 +176,14 @@ class Runtime:
                 "omitted_sampled_requests": omitted,
             }
             # Optional built-in types only: uninstrumented workers can unpickle this.
-            setattr(output, TRACE_PACKET_ATTR, {"contexts": contexts, "metadata": metadata})
+            try:
+                setattr(output, TRACE_PACKET_ATTR, {"contexts": contexts, "metadata": metadata})
+            except (AttributeError, TypeError):
+                self.log_once("carrier_unsupported", "carrier_unsupported worker_association=unavailable")
+            self.log_once(
+                "scheduler_active",
+                f"scheduler_active batch_size={metadata['batch_size']} contexts={len(contexts)}",
+            )
             if contexts:
                 self.submit(Packet(tuple(contexts), [Record("scheduler.schedule", origin, end)], metadata))
         finally:
@@ -233,6 +256,7 @@ class Runtime:
             output = kwargs.get("scheduler_output", args[0] if args else None)
             carrier = getattr(output, TRACE_PACKET_ATTR, None)
             setattr(runner, PENDING_PACKET_ATTR, carrier)
+            self.log_once("runner_active", f"runner_active carrier={str(bool(carrier)).lower()}")
         if not isinstance(carrier, dict) or not carrier.get("contexts"):
             return None
         packet = Packet(tuple(carrier["contexts"][: self.config.max_requests]), [], dict(carrier["metadata"]))
@@ -272,15 +296,16 @@ class Runtime:
         return run
 
     def request_arguments(self, signature, args, kwargs):
-        if "trace_headers" not in signature.parameters:
-            return args, kwargs
         bound = signature.bind(*args, **kwargs)
-        headers = dict(bound.arguments.get("trace_headers") or {})
+        prompt = bound.arguments.get("prompt")
+        # EngineCoreRequest inputs carry their own headers; vLLM may ignore the
+        # separate trace_headers argument for this input form.
+        headers = dict(getattr(prompt, "trace_headers", None) or bound.arguments.get("trace_headers") or {})
         context = self.request.get()
         if context is not None:
             headers["traceparent"] = context["traceparent"]
-            bound.arguments["trace_headers"] = headers
-            prompt = bound.arguments.get("prompt")
+            if "trace_headers" in signature.parameters:
+                bound.arguments["trace_headers"] = headers
             if hasattr(prompt, "trace_headers"):
                 prompt = copy.copy(prompt)
                 prompt.trace_headers = headers
@@ -293,6 +318,8 @@ class Runtime:
                 f"engine_request request_id={request_id} trace_id={trace_context['trace_id']} "
                 f"sampled={str(sampled).lower()}"
             )
+        else:
+            self.log_once("engine_missing_trace", "engine_request trace_context=missing check=request_middleware")
         return bound.args, bound.kwargs
 
     def wrap_add_request(self, original):
@@ -309,15 +336,21 @@ class Runtime:
         return add_request
 
     def wrap_trace_headers(self, original):
+        signature = inspect.signature(original)
+
         @functools.wraps(original)
-        async def trace_headers(owner, headers):
+        async def trace_headers(*args, **kwargs):
+            if self.disabled:
+                return await original(*args, **kwargs)
             try:
-                traceparent = headers.get("traceparent")
+                headers = signature.bind(*args, **kwargs).arguments["headers"]
+                active = self.request.get()
+                traceparent = active["traceparent"] if active is not None else headers.get("traceparent")
                 context = parse_traceparent(traceparent)
             except Exception:
                 context = None
             if context is None:
-                return await original(owner, headers)
+                return await original(*args, **kwargs)
             extracted = {"traceparent": traceparent}
             with suppress(Exception):
                 tracestate = headers.get("tracestate")
@@ -329,14 +362,56 @@ class Runtime:
 
         return trace_headers
 
-    def patch_method(self, owner, name, factory):
-        original = getattr(owner, name, None)
-        if original is not None and not getattr(original, "_runtime_timing_wrapped", False):
+    def patch_method(self, owner, name, factory, required=(), asynchronous=False):
+        target = f"{getattr(owner, '__name__', 'unknown')}.{name}"
+        try:
+            original = getattr(owner, name, None)
+            if original is None:
+                self.log(f"patch_skipped target={target} reason=missing")
+                return False
+            if getattr(original, "_runtime_timing_wrapped", False):
+                self.log(f"patch_existing target={target}")
+                return False
+            if (
+                not callable(original)
+                or inspect.iscoroutinefunction(original) != asynchronous
+                or inspect.isgeneratorfunction(original)
+                or inspect.isasyncgenfunction(original)
+                or not set(required).issubset(inspect.signature(original).parameters)
+            ):
+                self.log(f"patch_skipped target={target} reason=unsupported_signature")
+                return False
             wrapped = factory(original)
             wrapped._runtime_timing_wrapped = True
             setattr(owner, name, wrapped)
             return True
+        except Exception as error:
+            self.log(f"patch_skipped target={target} error={type(error).__name__}")
         return False
+
+    def attach_middleware(self, app):
+        try:
+            if self.disabled or getattr(app, MIDDLEWARE_ATTR, False):
+                return
+            app.add_middleware(RequestMiddleware, runtime=self)
+            setattr(app, MIDDLEWARE_ATTR, True)
+            self.log(f"middleware_installed pid={os.getpid()}")
+        except Exception as error:
+            self.log_once("middleware_skipped", f"middleware_skipped error={type(error).__name__}")
+
+    def wrap_serve_http(self, original):
+        signature = inspect.signature(original)
+
+        @functools.wraps(original)
+        async def serve_http(*args, **kwargs):
+            if not self.disabled:
+                # The launcher also covers api_server executed as __main__, for
+                # which Python does not call our import loader's exec_module.
+                with suppress(Exception):
+                    self.attach_middleware(signature.bind(*args, **kwargs).arguments["app"])
+            return await original(*args, **kwargs)
+
+        return serve_http
 
     def patch_module(self, module):
         if self.disabled:
@@ -349,8 +424,8 @@ class Runtime:
                     if self.patch_method(obj, "schedule", self.wrap_schedule):
                         patched.append(f"{obj.__name__}.schedule")
         elif name in RUNNER_MODULES:
-            runner = module.NPUModelRunner
-            if self.patch_method(runner, "execute_model", self.wrap_runner):
+            runner = getattr(module, "NPUModelRunner", None)
+            if self.patch_method(runner, "execute_model", self.wrap_runner, required=("scheduler_output",)):
                 patched.append("NPUModelRunner.execute_model")
             if self.patch_method(runner, "sample_tokens", lambda fn: self.wrap_runner(fn, sampling=True)):
                 patched.append("NPUModelRunner.sample_tokens")
@@ -358,12 +433,24 @@ class Runtime:
                 if self.patch_method(runner, method, lambda fn, method=method: self.wrap_stage(fn, f"runner.{method}")):
                     patched.append(f"NPUModelRunner.{method}")
         elif name == "vllm.v1.engine.async_llm":
-            if self.patch_method(module.AsyncLLM, "add_request", self.wrap_add_request):
+            if self.patch_method(
+                getattr(module, "AsyncLLM", None),
+                "add_request",
+                self.wrap_add_request,
+                required=("request_id", "prompt", "trace_headers"),
+                asynchronous=True,
+            ):
                 patched.append("AsyncLLM.add_request")
         elif name in TRACE_HEADER_MODULES:
             for obj in tuple(vars(module).values()):
                 if inspect.isclass(obj) and obj.__module__ == name and "_get_trace_headers" in vars(obj):
-                    if self.patch_method(obj, "_get_trace_headers", self.wrap_trace_headers):
+                    if self.patch_method(
+                        obj,
+                        "_get_trace_headers",
+                        self.wrap_trace_headers,
+                        required=("headers",),
+                        asynchronous=True,
+                    ):
                         patched.append(f"{obj.__name__}._get_trace_headers")
         elif name == "vllm.entrypoints.openai.api_server":
 
@@ -371,14 +458,16 @@ class Runtime:
                 @functools.wraps(original)
                 def build_app(*args, **kwargs):
                     app = original(*args, **kwargs)
-                    if not self.disabled:
-                        self.safe(lambda: app.add_middleware(RequestMiddleware, runtime=self))
+                    self.safe(self.attach_middleware, app)
                     return app
 
                 return build_app
 
             if self.patch_method(module, "build_app", wrap_build):
                 patched.append("build_app")
+        elif name == "vllm.entrypoints.launcher":
+            if self.patch_method(module, "serve_http", self.wrap_serve_http, required=("app",), asynchronous=True):
+                patched.append("serve_http")
         self.log(f"module={name} patched={','.join(patched) if patched else 'none'}")
 
     def install(self):
@@ -390,6 +479,7 @@ class Runtime:
             *TRACE_HEADER_MODULES,
             "vllm.v1.engine.async_llm",
             "vllm.entrypoints.openai.api_server",
+            "vllm.entrypoints.launcher",
         )
         sys.meta_path.insert(0, HookFinder(self, frozenset(modules)))
         self.log(
@@ -399,7 +489,7 @@ class Runtime:
         )
         for name in modules:
             if name in sys.modules:
-                self.safe(self.patch_module, sys.modules[name])
+                self.safe_patch_module(sys.modules[name])
 
 
 class HookLoader:
@@ -414,7 +504,7 @@ class HookLoader:
 
     def exec_module(self, module):
         self.loader.exec_module(module)
-        self.runtime.safe(self.runtime.patch_module, module)
+        self.runtime.safe_patch_module(module)
 
 
 class HookFinder(importlib.abc.MetaPathFinder):
@@ -442,7 +532,13 @@ class RequestMiddleware:
         self.app, self.runtime = app, runtime
 
     def begin(self, scope):
-        if scope["type"] != "http" or scope.get("path") not in ("/v1/chat/completions", "/v1/completions"):
+        if scope["type"] != "http":
+            return None
+        path = scope.get("path", "")
+        root = scope.get("root_path", "").rstrip("/")
+        if root and path.startswith(root + "/"):
+            path = path[len(root) :]
+        if path not in HTTP_PATHS:
             return None
         headers = dict(scope.get("headers", ()))
         incoming = parse_traceparent(headers.get(b"traceparent", b"").decode("ascii", errors="ignore"))
