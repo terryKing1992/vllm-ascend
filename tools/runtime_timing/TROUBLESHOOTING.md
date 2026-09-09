@@ -61,13 +61,16 @@ python tools/runtime_timing/check.py --inject-dir "$INJECT_DIR" 2>&1
 | `[timing-probe] trace_headers ...` | API 进程 | 旧版或新版请求入口已提取关联信息并将其继续传给 AsyncLLM |
 | `[timing-send] sent ...` | 模型或 worker 进程 | UDP 包已交给本机内核 |
 | `[timing-recv] received ...` | collector 进程 | UDP 包已收到并成功解析 |
-| JSON 行 | `timing.jsonl` | collector 已把一个阶段写入结果文件 |
+| `[timing-summary] export_failed=...` | collector 进程 | 某条请求摘要写出失败；记录失败计数，其他请求继续聚合 |
+| JSON 行 | `timing.jsonl` | 默认是一个已完成请求的摘要；`--report spans` 才逐阶段写入 |
 
 `sent` 不是 collector 的接收确认。UDP 不提供 ACK，collector 未运行时发送端也可能显示 `sent`。
 
 ## 快速判断
 
 高频诊断现在默认只打印首次及每 1000 次事件，`core` 模式也不会打印内部阶段的 patch；缺少某条逐请求日志不代表数据没有上报。先看 `timing.jsonl` 是否增长。需要逐条排障时，生成目录使用 `--detail full --diagnostic-every 1`，collector 使用 `--diagnostic-every 1`，两端均保留 `--diagnostic-log`。精简 JSON 没有冒号后的空格，按 trace 查找时用 `grep '具体TraceID' timing.jsonl` 或 JSON 解析工具。
+
+默认 `--report request` 会把本机收到的 decode 阶段包聚合起来；请求完成、根记录到达并等待约 1 秒后才输出一行。请求生成过程中 JSONL 不持续增长是预期行为。查看阶段统计用 `tail -1 timing.jsonl | jq '.metadata.timing_summary.stages'`，不再查找逐步的 JSON 行。正式运行时关闭两端 `--diagnostic-log`，即可避免逐条收发日志。
 
 ```text
 没有 timing-probe
@@ -83,7 +86,8 @@ python tools/runtime_timing/check.py --inject-dir "$INJECT_DIR" 2>&1
   → 端口不一致，或两个进程不在同一网络命名空间
 
 有 timing-recv，timing.jsonl 为空
-  → stdout 重定向错误，或 collector 导出线程失败
+  → 先等请求结束及汇总窗口，确认收到 vllm.request 根记录
+  → 然后检查 stdout 重定向和 collector 导出错误
 ```
 
 ## 1. 确认使用的是新注入目录
@@ -365,6 +369,8 @@ ss -lunp | grep 18765
 
 ## 10. 有 timing-recv，但 JSONL 为空
 
+默认摘要模式需要收到 `vllm.request` 根记录。仅收到 `scheduler.schedule` 或 `runner.*` 包时会等待，不生成伪造的请求摘要。先完成一次请求并等待约 2 秒；短时启用 collector 的 `--diagnostic-log --diagnostic-every 1`，确认接收日志包含 `names=vllm.request`。若缺失，回到第 7 节检查实际 HTTP 入口；多节点只在 worker 节点接收阶段包、没有请求根记录时也无法汇总。
+
 确认启动命令正确区分 stdout 和 stderr：
 
 ```bash
@@ -384,7 +390,7 @@ ls -l timing.jsonl timing-collector.log
 tail -50 timing-collector.log
 ```
 
-如果日志包含 `Export failed`、`dropped_packets` 或 `failed_packets`，保留错误类型及上下文。停止 collector 时还会打印最终的 `received`、`invalid` 和 `dropped` 计数。
+如果日志包含 `Export failed`、`export_failed`、`dropped_packets` 或 `failed_packets`，保留错误类型及上下文。停止 collector 时还会打印最终的接收、丢包及 `[timing-summary]` 聚合计数。`orphan_dropped` 表示缺少根记录的状态或包被丢弃；`evicted` 表示聚合容量不足，长请求还需核对 `--summary-ttl`。
 
 验证 JSONL：
 
@@ -393,7 +399,7 @@ wc -l timing.jsonl
 tail -1 timing.jsonl | python -m json.tool
 ```
 
-日志模式每写完一个数据包都会 flush，因此正常接收后不需要等待进程退出。
+每条请求摘要写出后都会 flush，不需要等待 collector 退出。摘要中的 `stage_data_status=missing` 表示根记录已收到但没有阶段数据；`history_evicted`、`truncated_packets`、`omitted_context_packets` 可提示已知缺失，不能把缺失字段当作 0 毫秒。具体读法见 [README.md](README.md) 的“如何看一条摘要”。
 
 ## 11. 最小排查信息
 

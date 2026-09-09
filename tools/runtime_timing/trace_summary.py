@@ -4,9 +4,10 @@ import math
 import sys
 import time
 from collections import OrderedDict
+from contextlib import suppress
 from dataclasses import dataclass, field, replace
 
-from trace_transport import Packet
+from trace_transport import DEFAULT_DIAGNOSTIC_EVERY, Packet, diagnostic_due
 
 STAGE_NAMES = frozenset(
     (
@@ -26,7 +27,6 @@ STAGE_NAMES = frozenset(
 )
 MAX_REQUEST_IDS = 8
 SWEEP_INTERVAL_SECONDS = 0.25
-ROOT_METRICS = ("api_to_engine_ms", "response_first_body_ms")
 
 
 @dataclass(frozen=True)
@@ -130,11 +130,12 @@ class RequestSummarySink:
         state = self.pending.get(key)
         if state is not None:
             return state
+        history_evicted = key in self.lost
         if len(self.pending) >= self.config.max_requests:
             oldest = next(iter(self.pending))
             self.stats["evicted"] += 1
             self._finish(oldest, "capacity", now)
-        state = RequestState(now, history_evicted=key in self.lost)
+        state = RequestState(now, history_evicted=history_evicted)
         self.pending[key] = state
         return state
 
@@ -193,7 +194,9 @@ class RequestSummarySink:
                     self.stats["ignored_stage_records"] += 1
                     continue
                 group = record.name, phase
-                stats = state.stages.setdefault(group, StageStats())
+                stats = state.stages.get(group)
+                if stats is None:
+                    stats = state.stages[group] = StageStats()
                 stats.add(
                     record,
                     integer(metadata.get("step")),
@@ -225,7 +228,9 @@ class RequestSummarySink:
             "max_queue_to_first_schedule_ms": state.max_queue_to_first_schedule_ms,
             "timing_kind": "host_wall_inclusive; calls across ranks; do not sum stages or ranks",
         }
-        metadata = {name: state.root.metadata[name] for name in ROOT_METRICS if name in state.root.metadata}
+        # Root metadata is already bounded by the input datagram size. Keep
+        # request-level diagnostic fields; only per-step history is discarded.
+        metadata = dict(state.root.metadata)
         metadata["timing_summary"] = summary
         record = replace(state.root, metadata=metadata)
         context = {
@@ -237,9 +242,17 @@ class RequestSummarySink:
         try:
             self.sink.emit(packet)
             self.stats["emitted"] += 1
-        except Exception:
+        except Exception as error:
             self.stats["export_failed"] += 1
-            raise
+            # A failed completed request must not discard the next incoming
+            # packet or prevent other requests from finishing their summaries.
+            if diagnostic_due(self.stats["export_failed"], DEFAULT_DIAGNOSTIC_EVERY):
+                with suppress(Exception):
+                    print(
+                        f"[timing-summary] export_failed={self.stats['export_failed']} error={type(error).__name__}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
 
     def poll(self):
         now = self.clock()

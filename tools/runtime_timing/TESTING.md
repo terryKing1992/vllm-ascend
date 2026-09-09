@@ -1,6 +1,6 @@
 # Runtime Timing 测试指南
 
-本文用于验证三个目标：耗时记录能够从模型进程送达 collector、记录能够按请求关联，以及观测组件故障时模型服务仍然可用。
+本文验证：每个推理请求保留一条摘要、所有收到的 decode 步骤参与阶段统计但不逐步上报，以及观测组件故障时模型服务仍能处理请求。不按请求快慢筛选，不设置普通请求抽样或每分钟上报配额。
 
 如果预期日志没有出现或 `timing.jsonl` 为空，请使用 [TROUBLESHOOTING.md](TROUBLESHOOTING.md)。
 
@@ -20,7 +20,7 @@ python -m unittest discover -s tests/ut -p 'test_runtime_timing*.py' -v
 
 `run.py` 不启动模型，也不收集数据。它生成一个固定的注入目录，其中的 `sitecustomize.py` 会在 Python 进程启动时自动加载打点模块。模型服务通过 `PYTHONPATH` 加载该目录后，打点模块会在目标 vLLM 模块导入时包装调度和执行方法。
 
-请求进入时生成或继承 `trace_id`，随后通过 `trace_headers` 进入调度器。调度器把关联信息附到本轮输出，worker 从中恢复请求上下文，并为实际执行的阶段记录开始和结束时间。采样记录编码成小型 JSON 数据包，通过本机非阻塞 UDP 发送给独立 collector。collector 解析数据包后，把每个阶段写成 `timing.jsonl` 中的一行。
+请求进入时生成或继承 `trace_id`，随后通过 `trace_headers` 进入调度器。调度器把关联信息附到本轮输出，worker 从中恢复请求上下文，并为实际执行的阶段记录开始和结束时间。记录通过本机非阻塞 UDP 发给独立 collector。collector 按 HTTP 请求根 span 汇总每个阶段的次数、均值和最大值；收到请求结束记录后等待默认 1 秒收齐晚到的数据，再输出一条 `vllm.request` 摘要。
 
 ```text
 HTTP 请求
@@ -30,10 +30,13 @@ HTTP 请求
   → runner wrapper 记录各阶段 Host 耗时
   → [timing-send] 非阻塞发送到 127.0.0.1:18765
   → [timing-recv] collector 接收并解析
-  → 每个阶段写成一行 JSON
+  → collector 按请求累积各阶段的次数、均值、最大值
+  → 请求结束后输出一行 JSON / 一个 Langfuse span
 ```
 
-模型进程不会等待 collector，也不会从 collector 接收确认。collector 不可用时，当前观测数据可能丢失，推理流程继续执行。
+decode 执行 10 步或 1000 步，摘要里都只保留按阶段和 prefill/decode 分组的统计项，不保存逐步列表。减少的是 JSONL/Langfuse 的输出量，本机逐步采集和 UDP 的工作仍然存在。
+
+模型进程不会等待 collector，也不会从 collector 接收确认。collector 不可用、队列已满或 UDP 丢包时，观测数据可能丢失；每请求上报是采集策略，不是持久化送达保证。
 
 ## 1. 测试前准备
 
@@ -54,13 +57,13 @@ git status --short
 
 ## 2. 基础自动化测试
 
-运行独立单元测试：
+运行全部独立回归测试：
 
 ```bash
-python tests/ut/test_runtime_timing_standalone.py
+python -m unittest discover -s tests/ut -p 'test_runtime_timing*.py' -v
 ```
 
-预期结果：全部测试通过并以 `OK` 结束。该测试覆盖采样、请求关联、UDP 收发、JSON 输出、导出队列、流式响应以及 collector 缺失或退出时的服务隔离。
+预期结果：测试以 `OK` 结束；没有 Langfuse SDK 时允许跳过 SDK 专用测试。测试覆盖请求关联、UDP、流式响应、故障隔离，以及大量 decode 记录聚合为一条摘要、不同请求隔离、晚到记录、容量和过期清理。模拟接口测试不能替代真实 NPU 验收。
 
 如果开发环境已安装 Ruff，再执行：
 
@@ -71,7 +74,8 @@ ruff check \
   tools/runtime_timing/trace_transport.py \
   tools/runtime_timing/collector.py \
   tools/runtime_timing/trace_export.py \
-  tests/ut/test_runtime_timing_standalone.py
+  tools/runtime_timing/trace_summary.py \
+  tests/ut/test_runtime_timing*.py
 
 ruff format --check \
   tools/runtime_timing/run.py \
@@ -79,7 +83,8 @@ ruff format --check \
   tools/runtime_timing/trace_transport.py \
   tools/runtime_timing/collector.py \
   tools/runtime_timing/trace_export.py \
-  tests/ut/test_runtime_timing_standalone.py
+  tools/runtime_timing/trace_summary.py \
+  tests/ut/test_runtime_timing*.py
 ```
 
 可选的 CPU 合成开销测试：
@@ -88,7 +93,7 @@ ruff format --check \
 python tools/runtime_timing/benchmark.py --iterations 10000 --batch-size 128
 ```
 
-记录 baseline、`sample_rate=0`、`sample_rate=0.01` 和 `sample_rate=1` 的 `host_us/batch`。该结果只比较 Python wrapper 的 CPU 开销，不能代替 NPU 吞吐和时延测试。
+脚本分别报告 Python wrapper 的 CPU 开销，以及 collector 汇总不同 decode 步数时的每步开销和实际 compact JSON 大小。摘要部分比较 10 步与 `--iterations` 步，输出中的 `jsonl_lines` 都应为 1；可比较 `json_bytes`，确认没有保存逐步列表。该脚本没有真实 UDP、模型执行或 Langfuse 网络发送，不能代替完整链路和 NPU 吞吐、时延测试。
 
 ## 3. 生成联调注入目录
 
@@ -111,7 +116,7 @@ ls -la observe-inject-test
 cat observe-inject-test/config.json
 ```
 
-预期至少包含 `enabled`、`config.json`、`sitecustomize.py`、`timing_probe.py` 和 `trace_transport.py`。联调阶段使用 100% 采样和每步记录；性能测试时关闭诊断日志并改回生产采样配置。
+预期至少包含 `enabled`、`config.json`、`sitecustomize.py`、`timing_probe.py` 和 `trace_transport.py`。默认值已是 `sample_rate=1`、`every_n_steps=1`、`detail=full`。联调命令额外开启逐条诊断，便于排查发送链路；性能测试和正式运行时关闭诊断，仍保留 `1/1/full`。
 
 ## 4. 启动 collector
 
@@ -120,7 +125,8 @@ cat observe-inject-test/config.json
 ```bash
 python tools/runtime_timing/collector.py \
   --output log \
-  --log-format full \
+  --report request \
+  --log-format compact \
   --port 18765 \
   --diagnostic-log --diagnostic-every 1 \
   > timing.jsonl \
@@ -136,10 +142,10 @@ head -20 timing-collector.log
 预期出现：
 
 ```text
-Collector listening on 127.0.0.1:18765, output=log
+Collector listening on 127.0.0.1:18765, output=log, report=request
 ```
 
-`timing.jsonl` 保存采集结果，`timing-collector.log` 保存接收诊断，两者不应混写。
+`timing.jsonl` 每个请求保存一行摘要，`timing-collector.log` 保存接收诊断，两者不应混写。默认就是 `--report request --log-format compact`；这里显式写出便于核对。`--log-format full` 只增加 JSON 字段，不会恢复逐步上报。
 
 ## 5. 启动模型服务
 
@@ -151,7 +157,7 @@ PYTHONPATH="$PWD/observe-inject-test${PYTHONPATH:+:$PYTHONPATH}" \
   --tensor-parallel-size 1
 ```
 
-将模型路径和并行参数替换为测试环境的实际值。必须重启模型进程，给已经运行的进程修改 `PYTHONPATH` 不会生效。容器或多节点环境中，模型进程与 collector 必须共享网络命名空间，远程 worker 也必须拥有并加载同一版本的注入目录。
+将模型路径和并行参数替换为测试环境的实际值。必须重启模型进程，给已经运行的进程修改 `PYTHONPATH` 不会生效。先在单节点、同一网络命名空间验收：当前 UDP 发往本机，分散到多台主机的 collector 不会自动合并数据；只有 worker 阶段、没有 HTTP 根记录的 collector 不会生成请求摘要。
 
 新注入目录启用诊断日志后，模型启动日志应立即出现：
 
@@ -202,14 +208,14 @@ tail -20 timing-collector.log
 
 预期出现 `[timing-recv] received`。该日志表示 collector 已收到并解析数据包。
 
-最后确认 JSONL 已写入：
+请求响应完成后再等待约 2 秒，确认 JSONL 已写入（默认汇总等待 1 秒，繁忙时还可能有队列等待）：
 
 ```bash
 wc -l timing.jsonl
 tail -20 timing.jsonl
 ```
 
-行数应大于 0，并且每一行都应是一个完整 JSON 对象。
+若文件是本次启动时新建且只有上述两次请求，预期两行，每行都是 `name=vllm.request` 的完整 JSON 对象。接收诊断可能有很多行，因为它记录了本机数据包；这不等于向 Langfuse 上报了很多 span。
 
 ## 8. 查看收集结果
 
@@ -219,31 +225,92 @@ tail -20 timing.jsonl
 tail -1 timing.jsonl | python -m json.tool
 ```
 
-按固定 Trace ID 查看一次请求的全部阶段：
+按固定 Trace ID 查看请求摘要：
 
 ```bash
 grep '12345678901234567890123456789012' timing.jsonl
 ```
 
-如果安装了 `jq`，可以只显示阶段和耗时：
+如果安装了 `jq`，先看请求及入口等待：
 
 ```bash
-jq -c 'select(.trace_id == "12345678901234567890123456789012") | {name,request_id,duration_ms,phase:.metadata.phase,step:.metadata.step}' timing.jsonl
+jq -c 'select(.trace_id == "12345678901234567890123456789012") | {name,span_id,duration_ms,api_to_engine_ms:.metadata.api_to_engine_ms,response_first_body_ms:.metadata.response_first_body_ms,summary:.metadata.timing_summary}' timing.jsonl
 ```
 
-重点检查：
+再把该请求的阶段统计按最大耗时排序：
+
+```bash
+jq 'select(.trace_id == "12345678901234567890123456789012") | .metadata.timing_summary.stages | sort_by(.max_host_ms) | reverse' timing.jsonl
+```
+
+以下 `summary` 指 `.metadata.timing_summary`：
 
 | 字段 | 验证内容 |
 | --- | --- |
-| `trace_id` | 同一请求的所有记录一致 |
-| `name` | 包含请求、调度和实际执行到的 runner 阶段 |
-| `duration_ms` | 为非负数，且符合该阶段的量级 |
-| `request_id` | 调度和 runner 记录能够关联到 vLLM 请求 |
-| `parent_span_id` | 子阶段指向请求或 runner 父阶段 |
-| `metadata.phase` | 首轮通常为 `prefill`，后续通常为 `decode` |
-| `metadata.step` | 从 0 开始，并符合 `every-n-steps` 配置 |
+| `trace_id`、`span_id`、`parent_span_id` | 保留 HTTP 请求的 trace、根 span 和传入父 span；同一 trace 下的不同 HTTP 请求仍是不同摘要 |
+| `name`、`duration_ms` | `vllm.request`；时长等于 `summary.request_ms`，是中间件观察到的请求时长 |
+| `metadata.api_to_engine_ms` | 请求进入到首次进入引擎接口的时间；高时先检查 API 处理和输入准备 |
+| `summary.max_queue_to_first_schedule_ms` | 调度器成功接收入队到首次调度开始的等待；一个 HTTP 请求有多个引擎请求时取最大值 |
+| `metadata.response_first_body_ms` | 到首个非空响应 body 的时间；SSE 首包可能只是角色或错误信息，不能直接当作 TTFT |
+| `summary.stages[].name`、`phase` | 实际收到的调度/runner 阶段，按 `prefill`、`decode`、`unknown` 分开统计 |
+| `summary.stages[].calls` | 收到的该阶段调用数，可包含多个 rank，不能直接当作输出 token 数 |
+| `summary.stages[].mean_host_ms`、`max_host_ms` | 均值持续偏高提示该阶段普遍慢；只有最大值高提示偶发慢调用，须与相同模型和负载的基线比较 |
+| `summary.stages[].slowest_step`、`slowest_rank`、`slowest_pid` | 定位最大耗时对应的 step、rank 和进程，便于继续排查 |
+| `summary.request_ids` | 对应的引擎请求 ID，最多保留 8 个；不能用其长度推断完整请求数 |
+| `summary.stage_data_status`、`step_interval` | `observed` 仅表示收到过阶段记录；当前配置预期步频为 1，不代表传输完整 |
+| `summary.history_evicted`、`truncated_packets`、`omitted_context_packets` | 标记已知的缓存淘汰、阶段截断或批次上下文省略；非零时应按部分数据解读 |
+| `summary.finish_reason` | 正常为 `request_complete`；`capacity`、`ttl`、`shutdown` 说明汇总提前或在关闭时结束 |
 
-同一 batch 的耗时可能关联到多个请求，并带有 `shared_batch_time=true`。该耗时是 Host inclusive 时间，不能解释为 NPU 算子独占时间。
+先比较 API 入口、排队等待和请求总耗时，再查看 prefill/decode 中变慢的阶段。阶段是 Host inclusive 时间：父方法包含子方法，批次时间可关联多个请求，多个 rank 可能并行。不要相加各阶段或各 rank 充当请求耗时，也不要用请求总时长减这些统计推断排队时间。没有 profiler 或 NPU 同步，因此这些数据用于定位需要排查的环节，不能证明某个 NPU 算子或通信独占了相应时间。
+
+字段缺失、`null`、空阶段列表或 `stage_data_status=missing` 都表示没有观测到，不能按 0 毫秒理解。即使所有缺失标记均为零，UDP 丢包也可能无法被完整检测。
+
+### 验证 decode 增多不会增加上报条数
+
+用新的 Trace ID，分别发一次 `max_tokens=32` 和一次 `max_tokens=128` 的请求：
+
+```bash
+for limit in 32 128; do
+  trace_id=$(printf '%032x' "$limit")
+  curl --fail-with-body http://127.0.0.1:8000/v1/chat/completions \
+    -H 'Content-Type: application/json' \
+    -H "traceparent: 00-$trace_id-1234567890123456-01" \
+    -d "{\"model\":\"/path/to/model\",\"messages\":[{\"role\":\"user\",\"content\":\"Please write a long story.\"}],\"max_tokens\":$limit,\"stream\":false}" \
+    > "response-$limit.json"
+done
+```
+
+响应完成并等待汇总后检查：
+
+```bash
+python - <<'PY'
+import json
+from pathlib import Path
+
+rows = [json.loads(line) for line in Path("timing.jsonl").read_text().splitlines() if line]
+for limit in (32, 128):
+    matches = [row for row in rows if row["trace_id"] == f"{limit:032x}"]
+    assert len(matches) == 1, (limit, "expected one request summary", len(matches))
+    row = matches[0]
+    assert row["name"] == "vllm.request"
+    stages = row["metadata"]["timing_summary"]["stages"]
+    decode = [stage for stage in stages if stage["phase"] == "decode"]
+    response = json.loads(Path(f"response-{limit}.json").read_text())
+    print("max_tokens=", limit, "usage=", response.get("usage"), "decode=", decode)
+PY
+```
+
+两次都只产生一行。若实际生成更多 token，通常会增加 decode 的 `calls`，但不会增加 JSONL 行数或新增逐步列表。`max_tokens` 是上限，模型可能提前结束；必须结合响应中的实际 token 数判断是否确实增加了 decode。重复本测试应换新的 Trace ID，或重新启动 collector 使用新输出文件。
+
+### 验证 Langfuse 输出相同摘要
+
+按 [README.md](README.md) 安装 v3 SDK 并通过运行环境配置服务器和密钥，停止日志 collector，在相同端口启动：
+
+```bash
+python tools/runtime_timing/collector.py --output langfuse --report request --port 18765
+```
+
+使用新的 Trace ID 重复请求；等待汇总和 SDK 批量发送后，在 Langfuse 按 Trace ID 查找。本工具应为每个 HTTP 请求新增一个 `vllm.request` observation，其 metadata 包含 `timing_summary`，不应有本工具逐 decode 生成的 observation。上游应用可能已有自己的 span，不能把整条 trace 的所有 span 数当成本工具的上报数。
 
 ## 9. 故障隔离测试
 
@@ -265,21 +332,26 @@ jq -c 'select(.trace_id == "12345678901234567890123456789012") | {name,request_i
 
 仅在一次性测试副本中进行。使用缺少 `timing_probe.py` 或包含无效 `config.json` 的测试注入目录启动模型。预期打点被跳过，模型服务仍可用。不要修改正在使用的生产注入目录。
 
-## 10. 采样验证
+## 10. 配置与容量验证
 
-精简配置及用法见 [README.md](README.md) 的“日常定界”。独立回归测试覆盖核心/完整阶段切换、诊断限频不影响发送和导出数量、精简 JSON 的 trace 父子关系，以及第 0、50、100 步采样。完整排障命令使用 `--detail full --diagnostic-every 1`，避免把正常限频误判成没有数据。
+正式配置保留 `--sample-rate 1 --every-n-steps 1 --detail full`，collector 使用 `--report request`。生成目录时不传 `--diagnostic-log`，collector 启动时也不传此参数，即可关闭逐步诊断日志，摘要照常输出。诊断开关和 `--diagnostic-every` 只控制诊断打印，不决定哪些请求上报。
 
-分别生成注入目录并重启服务验证：
+默认 `--summary-max-requests 2048` 限制同时汇总的请求状态数，`--summary-ttl 300` 是状态寿命，`--summary-grace 1` 是收到根记录后等待晚到阶段的时间；它们都不是每分钟上报限额。根记录已收到时，容量或过期清理可提前输出部分摘要；一直没有根记录时丢弃阶段状态，不伪造一个完整请求。压测时检查 collector 退出统计中的 `evicted`、`orphan_dropped`、`late_packets`、`export_failed` 和导出队列的 dropped/failed 计数。`orphan_dropped` 是状态/数据包计数，不等于精确丢失请求数。
 
-- `sample-rate=0`：不安装 hook，JSONL 不应产生新记录。
-- `sample-rate=1`、`every-n-steps=1`：每个合规请求都应被选中，适合联调。
-- `sample-rate=0.01`、`every-n-steps=10`：用于生产候选配置，记录量应明显下降。
+本工具仍尊重传入 `traceparent` 的采样标志：flags 为 `00` 时不记录该请求。要求覆盖全部请求时，上游需传 `01` 或不传 trace 头。不要把 `sample-rate=0.01` 或 `every-n-steps=10` 用作本目标的正式配置：前者会漏掉请求，后者会遗漏 decode 步骤。
 
-采样是按 Trace ID 确定性选择。同一 Trace ID 重复请求的选中结果一致；`traceparent` 最后的 flags 为 `00` 时，上游禁止采样，本工具不应记录该请求。
+仅在需要查看短时原始阶段时，停止现有 collector 后换用以下命令，输出到单独文件：
+
+```bash
+python tools/runtime_timing/collector.py --output log --report spans \
+  --log-format full --port 18765 > timing-spans.jsonl 2> timing-spans-collector.log
+```
+
+`--report spans` 恢复逐阶段输出，数据量会随 decode 增加；它只用于排障，不属于每请求一条摘要的正式验收。
 
 ## 11. NPU 性能验收
 
-在相同模型、输入数据、并发、请求数和预热条件下，分别测试未注入、生产采样配置以及联调配置。至少记录：
+在相同模型、输入数据、并发、请求数和预热条件下，比较未注入基线与 `--sample-rate 1 --every-n-steps 1 --detail full`、collector `--report request` 的正式配置。两端诊断均关闭，collector 应使用计划部署的实际输出后端。至少记录：
 
 - 请求成功率和错误类型；
 - 吞吐量；
@@ -287,15 +359,16 @@ jq -c 'select(.trace_id == "12345678901234567890123456789012") | {name,request_i
 - Host CPU、内存和 NPU 利用率；
 - `timing.jsonl` 记录数和 collector 的 dropped/failed 计数。
 
-生产验收以未注入和 `sample-rate=0.01 --every-n-steps=10` 的差异为准。CPU 合成 benchmark 只能作为代码级回归参考。
+增加输出长度再次比较：请求数相同时，JSONL/Langfuse 的摘要数量应不随 decode 步数增长；同时检查本机 CPU、UDP、collector 队列压力和阶段覆盖，不能只看外部上报条数。实际性能是否可接受以目标 NPU 环境的测量为准。
 
 ## 12. 验收标准
 
 - 非流式和流式请求均正常完成，响应内容未因打点改变。
-- 模型端出现 `[timing-send]`，collector 端出现 `[timing-recv]`，JSONL 中存在对应 Trace ID。
-- JSONL 每行都能被 JSON 解析，时间戳、耗时和父子关系有效。
+- 开启联调诊断时，模型端出现 `[timing-send]`，collector 端出现 `[timing-recv]`；关闭诊断后请求摘要仍正常输出。
+- 健康单节点测试中每个 HTTP 请求产生一条 JSONL 摘要或一个 Langfuse observation；短请求和长请求都保留，decode 增多仅改变阶段统计。
+- JSONL 每行都能被 JSON 解析，请求关联、耗时、阶段计数及缺失标志可解释。
 - 停止、重启或错误配置 collector 时，模型服务仍能持续处理请求。
-- 采样率和步频配置符合预期。
+- 默认 `1/1/full` 配置生效，所有收到的 decode 步骤参与汇总，不逐步导出。
 - NPU 实机性能下降处于项目约定的可接受范围。
 
-测试完成后，生产注入目录应关闭 `--diagnostic-log` 并恢复正式采样参数，避免模型热路径持续打印诊断日志。
+测试完成后重新生成不带 `--diagnostic-log` 的注入目录并重启模型，collector 也关闭诊断。保留 `1/1/full` 和 `--report request`，避免把关闭诊断误操作成降低请求覆盖率。

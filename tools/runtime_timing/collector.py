@@ -97,7 +97,7 @@ def main():
         "--log-format",
         choices=("compact", "full"),
         default="compact",
-        help="log output only: compact keeps trace IDs, duration and batch/phase metadata",
+        help="log output only: compact keeps trace IDs, duration and summary/batch metadata",
     )
     parser.add_argument("--port", type=int, default=18765)
     parser.add_argument("--queue-size", type=int, default=256)

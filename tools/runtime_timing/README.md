@@ -46,10 +46,23 @@ python tools/runtime_timing/collector.py --output log --report request \
 | `stages` | 按阶段 `name` 和 `phase` 分组，查看 `calls`、`mean_host_ms`、`max_host_ms` |
 | `slowest_step`、`slowest_rank`、`slowest_pid` | 每组最慢观测发生在哪一步、哪个 worker；字段位于对应 stage 中 |
 | `max_queue_to_first_schedule_ms` | 接口支持时记录的入队至首次调度间隔；缺失不能当作 0 |
-| `stage_data_status`、`finish_reason` | 先检查阶段是否收到、是否被截断，以及摘要是否因正常结束、超时或容量限制而结束 |
+| `stage_data_status`、`finish_reason` | 检查阶段是否收到，以及摘要是否因正常结束、超时或容量限制而结束 |
+| `history_evicted`、`truncated_packets`、`omitted_context_packets` | 检查已知的历史驱逐、阶段截断和批次关联不足；计数为 0 仍不能证明 UDP 无丢包 |
 | `coverage` | `best_effort_received_records`：统计 collector 实际收到的记录，不宣称覆盖所有 worker 和步骤 |
 
 请求根 metadata 的 `api_to_engine_ms` 可帮助观察进入引擎前的耗时，`response_first_body_ms` 是首个响应 body 的时刻，**不是首 token 时间 TTFT**。先找请求总耗时异常，再比较 prefill/decode 各阶段的均值和最大值，定位应进一步检查的阶段。
+
+### 如何看一条摘要
+
+```bash
+# 最近完成的请求：总耗时、进入引擎前耗时、入队后的首次调度等待
+tail -1 timing.jsonl | jq '{trace_id,span_id,duration_ms,api_to_engine_ms:.metadata.api_to_engine_ms,queue_ms:.metadata.timing_summary.max_queue_to_first_schedule_ms}'
+
+# 同一请求：按阶段列出 prefill/decode 的观测次数、平均值和最大值
+tail -1 timing.jsonl | jq '.metadata.timing_summary.stages'
+```
+
+先与相同模型、输入长度和并发下的正常请求比较：`api_to_engine_ms` 异常升高先查 API 层到引擎入口的处理；`max_queue_to_first_schedule_ms` 异常升高先查入队后的等待。阶段中 `_prepare_inputs` 升高先查输入准备，`_model_forward` 或 `execute_model` 升高先查模型执行路径，`sample_tokens` 升高先查采样及结果处理。decode 的 `mean_host_ms` 持续升高表示常态变慢，只有 `max_host_ms` 升高则利用 `slowest_step/rank/pid` 查偶发慢点。`calls` 包含多个 rank 的观测，不等于输出 token 数。
 
 阶段是 Host inclusive 时间，父子阶段会重叠，多 rank 可能并行，同一 batch 还被多个请求共享。**不能把这些时间相加或扣差推算排队，更不能仅凭它们断言 NPU 计算或通信硬件 bound。**
 
@@ -248,7 +261,7 @@ vllm.request
 ```
 
 v2 runner 对应方法可能为 prepare_inputs、postprocess 等，只记录实际执行的方法。
-每条记录包含请求 ID、batch ID、step、调度 token 数、来源 PID 和可用的 rank。
+原始阶段包包含请求 ID、batch ID、step、调度 token 数、来源 PID 和可用的 rank；摘要只保留固定的统计字段及最慢观测的位置。
 phase 以是否已有输出 token 区分 prefill / decode，首轮 prefix-cache 命中也记为 prefill。
 
 **一次 batch 的阶段时间是多个请求共享的。** 同一段时间关联到各个选中的请求，并标注 shared_batch_time=true。
@@ -279,16 +292,16 @@ SystemExit、KeyboardInterrupt、任务取消等正常控制流程不作为可�
 
 ## 采样、容量及关闭
 
-下表是生成工具的默认值；“每个请求一条摘要”应显式使用开头的 `--sample-rate 1 --every-n-steps 1 --detail full`。
+生成工具默认采集所有允许采样的请求及每个步骤，由 collector 汇总后控制上传量。旧注入目录中的配置不会随代码更新，需重新生成并重启模型。
 
 | 生成参数 | 默认 | 上限或含义 |
 | --- | --- | --- |
-| --sample-rate | 0.01 | 0 到 1；为 0 时启动不安装 hooks |
-| --every-n-steps | 10 | 每个采样请求记录第 0、10、20……步 |
+| --sample-rate | 1 | 0 到 1；为 0 时启动不安装 hooks |
+| --every-n-steps | 1 | 每个采样请求记录所有步骤；增大此值会遗漏中间慢步骤 |
 | --max-records | 16 | 每个 runner 调用最多 32 个阶段，含根 span |
 | --max-requests | 4 | 每个 batch 最多 8 个已采样请求 |
 | --collector-port | 18765 | 本机 collector 端口 |
-| --detail | core | core 仅记录请求/调度/执行/采样；full 增加内部阶段 |
+| --detail | full | core 仅记录请求/调度/执行/采样；full 增加内部阶段 |
 | --diagnostic-every | 1000 | 开启诊断时，各类高频事件打印首次及每 N 次；1 为逐条打印 |
 
 每个 UDP 包最多 8192 字节，超长整包丢弃，不分片、不重试。
@@ -308,6 +321,8 @@ collector 退出时报告 received、invalid、dropped；网络导出的错误�
 
 超时、容量驱逐或退出时，有根记录的状态输出已收到的摘要；缺少根记录的状态丢弃并计数。长请求应按实际时长调大 TTL。晚于摘要结束的阶段不会补写到 Langfuse；观察 `finish_reason` 和阶段状态，避免把不完整摘要误认作完整推理过程。
 
+聚合需要请求根记录与阶段包到达同一个 collector。目前 UDP 只发送到本机；多节点环境下，仅收到远程 worker 阶段、收不到 API 请求根记录的 collector 不会输出请求摘要，需要额外的跨节点汇聚适配。
+
 仅停止 collector 即可停止日志输出或向 Langfuse 上传，但模型仍会做采样计时。
 彻底关闭：从模型启动环境移除注入 PYTHONPATH，按原部署流程重启。
 也可以部署 sample-rate=0 的新目录，或移除 enabled 标记后重启。
@@ -316,13 +331,13 @@ enabled 只在进程启动时读取，不是运行中的热开关。不要在热
 ## 验证与适配边界
 
 ```bash
-python tests/ut/test_runtime_timing_standalone.py
+python -m unittest discover -s tests/ut -p 'test_runtime_timing*.py'
 python tools/runtime_timing/benchmark.py
 ```
 
 测试使用 CPU 模拟业务，包括 collector 缺失/被杀、前后置打点异常、时钟失败、序列化失败、队列拥塞、
 流式响应不变、无 SDK 启动、缺失注入文件、普通类型 IPC，以及真实 SDK 的时间戳和父子关联。
-SDK 远程网络出口被测试替换；另有本机真实 UDP 发送/接收测试。
+SDK 远程网络出口被测试替换；另有本机真实 UDP 发送/接收测试。摘要回归覆盖 1000 次 decode 只产生一个 Langfuse span、快请求全部保留，以及某条摘要导出失败后其他请求继续聚合。
 benchmark 只统计空函数 wrapper 路径，未计入真实模型执行、UDP 编码发送和 collector 导出，不能据此承诺 NPU 吞吐不变。
 
 当前适配本仓库 v1/v2 runner、常见 scheduler 和 vllm serve。

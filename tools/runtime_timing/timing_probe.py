@@ -61,14 +61,14 @@ TRACE_HEADER_MODULES = (
 
 @dataclass(frozen=True)
 class Config:
-    sample_rate: float = 0.01
-    every_n_steps: int = 10
+    sample_rate: float = 1.0
+    every_n_steps: int = 1
     max_records: int = 16
     max_requests: int = 4
     collector_port: int = 18765
     diagnostic_log: bool = False
     diagnostic_every: int = DEFAULT_DIAGNOSTIC_EVERY
-    detail: str = "core"
+    detail: str = "full"
 
 
 def parse_traceparent(value):

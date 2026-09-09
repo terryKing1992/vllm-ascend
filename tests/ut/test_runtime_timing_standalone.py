@@ -28,6 +28,7 @@ from collector import Collector  # noqa: E402
 from run import prepare  # noqa: E402
 from timing_probe import Config, RequestMiddleware, Runtime, package_version, parse_traceparent, selected  # noqa: E402
 from trace_export import BufferedExporter, CollectorConfig, JsonLogSink, LangfuseSink  # noqa: E402
+from trace_summary import RequestSummarySink, SummaryConfig  # noqa: E402
 from trace_transport import DatagramEmitter, Packet, Record, decode_packet  # noqa: E402
 
 TRACE_ID = "12345678901234567890123456789012"
@@ -94,14 +95,28 @@ class TestTracing(unittest.TestCase):
         )
         emitter = DatagramEmitter(port)
         try:
-            self.assertIn("output=log", process.stderr.readline())
-            emitter.submit(Packet(tuple(self.carrier()["contexts"]), [Record("execute", 1, 2)]))
+            self.assertIn("output=log, report=request", process.stderr.readline())
+            for step in range(2):
+                context = {
+                    "trace_id": TRACE_ID,
+                    "parent_span_id": "a" * 16,
+                    "request_id": "test-request",
+                    "metadata": {"phase": "decode", "step": step},
+                }
+                emitter.submit(Packet((context,), [Record("runner.execute_model", 1, 2_000_001)]))
+            emitter.submit(Packet(tuple(self.carrier()["contexts"]), [Record("vllm.request", 1, 2, span_id="a" * 16)]))
             lines = []
             reader = threading.Thread(target=lambda: lines.append(process.stdout.readline()), daemon=True)
             reader.start()
             reader.join(timeout=5)
             self.assertFalse(reader.is_alive(), "collector must flush log packets")
-            self.assertEqual(json.loads(lines[0])["trace_id"], TRACE_ID)
+            event = json.loads(lines[0])
+            self.assertEqual(event["trace_id"], TRACE_ID)
+            self.assertEqual(event["name"], "vllm.request")
+            stages = event["metadata"]["timing_summary"]["stages"]
+            self.assertEqual(len(stages), 1)
+            self.assertEqual(stages[0]["calls"], 2)
+            self.assertEqual(stages[0]["mean_host_ms"], 2)
         finally:
             process.terminate()
             process.communicate(timeout=5)
@@ -592,6 +607,53 @@ class TestTracing(unittest.TestCase):
             self.assertEqual(spans[1].start_time, start + 50)
             self.assertEqual(spans[1].end_time, start + 100)
             self.assertEqual(json.loads(spans[1].attributes["langfuse.observation.metadata"])["pid"], 123)
+
+    @unittest.skipUnless(importlib.util.find_spec("langfuse"), "optional Langfuse SDK is not installed")
+    def test_real_sdk_exports_one_summary_for_a_thousand_decode_steps(self):
+        from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+        from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+        from requests import Response
+
+        response = Response()
+        response.status_code, response._content = 200, b""
+        env = {
+            "LANGFUSE_PUBLIC_KEY": "pk-lf-test-runtime-summary",
+            "LANGFUSE_SECRET_KEY": "sk-lf-test-runtime-summary",
+            "LANGFUSE_BASE_URL": "http://127.0.0.1:9",
+            "LANGFUSE_TRACING_ENABLED": "true",
+        }
+        with patch.dict(os.environ, env), patch("requests.Session.post", return_value=response) as post:
+            sink = LangfuseSink(CollectorConfig())
+            memory = InMemorySpanExporter()
+            sink.provider.add_span_processor(SimpleSpanProcessor(memory))
+            summary = RequestSummarySink(SummaryConfig(), sink)
+            start = time.time_ns() - 1_000_000_000
+            context = {"trace_id": TRACE_ID, "parent_span_id": "a" * 16, "metadata": {"phase": "decode"}}
+            packet = Packet((context,), [Record("runner.execute_model", start, start + 1_000_000)])
+            for step in range(1000):
+                context["metadata"]["step"] = step
+                summary.emit(packet)
+            self.assertEqual(len(memory.get_finished_spans()), 0)
+            summary.emit(
+                Packet(
+                    tuple(self.carrier()["contexts"]),
+                    [Record("vllm.request", start, start + 100_000_000, span_id="a" * 16)],
+                )
+            )
+            summary.close()
+
+            self.assertTrue(post.called)
+            spans = memory.get_finished_spans()
+            self.assertEqual(len(spans), 1)
+            span = spans[0]
+            self.assertEqual(span.name, "vllm.request")
+            self.assertEqual(format(span.context.trace_id, "032x"), TRACE_ID)
+            self.assertEqual(format(span.context.span_id, "016x"), "a" * 16)
+            self.assertEqual(format(span.parent.span_id, "016x"), PARENT_ID)
+            self.assertEqual((span.start_time, span.end_time), (start, start + 100_000_000))
+            metadata = json.loads(span.attributes["langfuse.observation.metadata"])
+            self.assertEqual(metadata["timing_summary"]["stages"][0]["calls"], 1000)
+            self.assertEqual(metadata["timing_summary"]["stages"][0]["mean_host_ms"], 1)
 
     def test_service_survives_missing_and_killed_collector(self):
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as reservation:

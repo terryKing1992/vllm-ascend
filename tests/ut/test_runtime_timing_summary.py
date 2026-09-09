@@ -5,6 +5,7 @@ import json
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 TOOL_DIR = Path(__file__).resolve().parents[2] / "tools" / "runtime_timing"
 sys.path.insert(0, str(TOOL_DIR))
@@ -215,7 +216,9 @@ class TestRequestSummary(unittest.TestCase):
         self.assertEqual(exported.contexts, packet.contexts)
         record = exported.records[0]
         original = packet.records[0]
-        self.assertEqual((record.start_ns, record.end_ns, record.span_id), (original.start_ns, original.end_ns, ROOT_ID))
+        self.assertEqual(
+            (record.start_ns, record.end_ns, record.span_id), (original.start_ns, original.end_ns, ROOT_ID)
+        )
         self.assertEqual(record.error, "CancelledError")
         self.assertEqual(record.metadata["path"], "/v1/chat/completions")
         self.assertEqual(self.payload()["stage_data_status"], "missing")
@@ -267,6 +270,50 @@ class TestRequestSummary(unittest.TestCase):
         self.finish()
 
         self.assertEqual(set(self.stages()), {("runner.execute_model", "decode")})
+
+    def test_fast_requests_are_all_exported_without_a_reporting_budget(self):
+        for index in range(120):
+            self.summary.emit(root_packet(root_id=f"{index + 1:016x}", duration_ms=1))
+        self.finish()
+
+        self.assertEqual(len(self.sink.packets), 120)
+        self.assertTrue(all(self.payload(index)["request_ms"] == 1 for index in range(120)))
+
+    def test_failed_export_does_not_discard_the_next_request_or_retry_failed_root(self):
+        self.summary.emit(root_packet())
+        self.clock.advance(2)
+        other_root = "b" * 16
+        with (
+            patch.object(self.sink, "emit", side_effect=OSError("unavailable")),
+            patch("builtins.print", side_effect=OSError("broken stderr")),
+        ):
+            self.summary.emit(root_packet(root_id=other_root))
+        self.assertIn((TRACE_ID, other_root), self.summary.pending)
+        self.assertEqual(self.summary.stats["export_failed"], 1)
+        self.summary.emit(root_packet())
+        self.finish()
+
+        self.assertEqual(len(self.sink.packets), 1)
+        self.assertEqual(self.sink.packets[0].records[0].span_id, other_root)
+
+    def test_sampling_and_capacity_gaps_are_visible_in_summary(self):
+        self.summary = RequestSummarySink(SummaryConfig(max_requests=1), self.sink, clock=self.clock)
+        self.summary.emit(stage_packet())
+        self.summary.emit(stage_packet(root_id="b" * 16))
+        packet = stage_packet(step=10)
+        packet.metadata.update(every_n_steps=10, truncated_stage_calls=2, omitted_sampled_requests=1)
+        packet.contexts[0]["metadata"]["queue_to_first_schedule_ms"] = 7.5
+        self.summary.emit(packet)
+        self.summary.emit(root_packet())
+        self.finish()
+
+        payload = self.payload()
+        self.assertTrue(payload["history_evicted"])
+        self.assertEqual(payload["step_interval"], 10)
+        self.assertEqual(payload["truncated_packets"], 1)
+        self.assertEqual(payload["omitted_context_packets"], 1)
+        self.assertEqual(payload["max_queue_to_first_schedule_ms"], 7.5)
+        self.assertEqual(payload["received_stage_records"], 1)
 
     def test_compact_json_preserves_summary_and_trace_identity(self):
         stream = io.StringIO()
