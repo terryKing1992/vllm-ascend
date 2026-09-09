@@ -17,6 +17,8 @@
 
 ## 适配方式
 
+默认 `--detail core` 仅安装请求、调度及 runner 的 execute/sample 边界，跳过内部阶段；跨版本内部方法诊断使用 `--detail full`。高频诊断默认限频，逐条排障时两端设置 `--diagnostic-every 1`。
+
 | 能力 | 实现与降级 |
 | --- | --- |
 | 请求根 span | 在 `openai.api_server.build_app` 注册 ASGI 中间件；`entrypoints.launcher.serve_http` 再检查并补装，覆盖通过 `python -m ...api_server` 启动的情况；同一个 app 只安装一次 |

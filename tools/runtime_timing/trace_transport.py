@@ -10,6 +10,11 @@ from dataclasses import asdict, dataclass, field
 MAX_DATAGRAM_BYTES = 8192
 MAX_RECORDS = 32
 MAX_REQUESTS = 8
+DEFAULT_DIAGNOSTIC_EVERY = 1000
+
+
+def diagnostic_due(count, every):
+    return count == 1 or count % every == 0
 
 
 @dataclass
@@ -33,9 +38,12 @@ class Packet:
 
 
 class DatagramEmitter:
-    def __init__(self, port, diagnostic_log=False):
+    def __init__(self, port, diagnostic_log=False, diagnostic_every=DEFAULT_DIAGNOSTIC_EVERY):
         self.address = ("127.0.0.1", port)
         self.diagnostic_log = diagnostic_log
+        if diagnostic_every < 1:
+            raise ValueError("diagnostic_every must be positive")
+        self.diagnostic_every = diagnostic_every
         self.socket = None
         self.pid = os.getpid()
         self.dropped = 0
@@ -55,7 +63,8 @@ class DatagramEmitter:
         data = json.dumps(body, separators=(",", ":"), allow_nan=False).encode("utf-8")
         if len(data) > MAX_DATAGRAM_BYTES:
             self.dropped += 1
-            self._log(f"dropped=oversize bytes={len(data)} limit={MAX_DATAGRAM_BYTES}")
+            if self.diagnostic_log and diagnostic_due(self.dropped, self.diagnostic_every):
+                self._log(f"dropped=oversize total={self.dropped} bytes={len(data)} limit={MAX_DATAGRAM_BYTES}")
             return
         if self.pid != os.getpid():
             if self.socket is not None:
@@ -74,14 +83,16 @@ class DatagramEmitter:
         try:
             self.socket.sendto(data, self.address)
             self.sent += 1  # Accepted by local kernel, not a delivery acknowledgement.
-            names = ",".join(record.name for record in packet.records)
-            self._log(
-                f"sent packet={self.sent} bytes={len(data)} port={self.address[1]} "
-                f"requests={len(packet.contexts)} records={len(packet.records)} names={names}"
-            )
+            if self.diagnostic_log and diagnostic_due(self.sent, self.diagnostic_every):
+                names = ",".join(record.name for record in packet.records)
+                self._log(
+                    f"sent packet={self.sent} dropped={self.dropped} bytes={len(data)} port={self.address[1]} "
+                    f"requests={len(packet.contexts)} records={len(packet.records)} names={names}"
+                )
         except OSError as error:
             self.dropped += 1
-            self._log(f"dropped=socket error={type(error).__name__} port={self.address[1]}")
+            if self.diagnostic_log and diagnostic_due(self.dropped, self.diagnostic_every):
+                self._log(f"dropped=socket total={self.dropped} error={type(error).__name__} port={self.address[1]}")
 
 
 def decode_packet(data):

@@ -18,12 +18,14 @@ class CollectorConfig:
     queue_size: int = 256
     flush_at: int = 256
     flush_interval: float = 2.0
+    log_format: str = "full"
 
 
 class JsonLogSink:
     def __init__(self, config, stream=None):
         self.stream = stream if stream is not None else sys.stdout
         self.host = socket.gethostname()
+        self.log_format = config.log_format
 
     def emit(self, packet):
         for request in packet.contexts:
@@ -47,7 +49,33 @@ class JsonLogSink:
                     "pid": packet.metadata.get("source_pid"),
                     "metadata": {**packet.metadata, **request.get("metadata", {}), **record.metadata},
                 }
-                self.stream.write(json.dumps(event, ensure_ascii=False, allow_nan=False) + "\n")
+                if self.log_format == "compact":
+                    for key in ("start_ns", "end_ns", "timing_kind"):
+                        event.pop(key)
+                    if event["error"] is None:
+                        event.pop("error")
+                    event["metadata"] = {
+                        key: value
+                        for key, value in event["metadata"].items()
+                        if key
+                        in (
+                            "phase",
+                            "step",
+                            "rank",
+                            "batch_id",
+                            "shared_batch_time",
+                            "batch_size",
+                            "scheduled_tokens",
+                            "omitted_sampled_requests",
+                            "truncated_stage_calls",
+                            "timing_summary",
+                            "api_to_engine_ms",
+                            "response_first_body_ms",
+                            "reporting_mode",
+                        )
+                    }
+                separators = (",", ":") if self.log_format == "compact" else None
+                self.stream.write(json.dumps(event, ensure_ascii=False, allow_nan=False, separators=separators) + "\n")
         self.stream.flush()
 
     def close(self):
@@ -171,6 +199,13 @@ class BufferedExporter:
                 try:
                     packet = self.queue.get(timeout=0.5)
                 except queue.Empty:
+                    if sink is not None and callable(getattr(sink, "poll", None)):
+                        try:
+                            sink.poll()
+                        except Exception as error:
+                            self.failed += 1
+                            if self.failed == 1:
+                                print(f"[timing] Summary export failed ({type(error).__name__}).", file=sys.stderr)
                     continue
                 try:
                     if time.monotonic() < next_retry:

@@ -236,6 +236,7 @@ class TestCompatibility(unittest.TestCase):
                     every_n_steps=1,
                     collector_port=collector.socket.getsockname()[1],
                     diagnostic_log=True,
+                    detail="full",
                 )
             ),
         )

@@ -14,6 +14,8 @@ python -m unittest discover -s tests/ut -p 'test_runtime_timing*.py' -v
 
 兼容测试中的 API/worker 使用模拟 vLLM 接口，真实执行跨进程传输和日志输出；通过这些测试后，仍需执行下文的模型实机步骤。
 
+启动回归还覆盖新旧注入目录并存、原有 sitecustomize 只执行一次、配置/导入失败仍可继续业务、损坏 stderr，以及 `-S/-I/-E` 禁用自动加载时检查命令正确报错。部署前按 [TROUBLESHOOTING.md](TROUBLESHOOTING.md) 开头的命令检查，`PASS` 只证明该解释器进程的注入成功，不证明模型请求已经上报。
+
 ## 工作原理
 
 `run.py` 不启动模型，也不收集数据。它生成一个固定的注入目录，其中的 `sitecustomize.py` 会在 Python 进程启动时自动加载打点模块。模型服务通过 `PYTHONPATH` 加载该目录后，打点模块会在目标 vLLM 模块导入时包装调度和执行方法。
@@ -95,10 +97,11 @@ python tools/runtime_timing/benchmark.py --iterations 10000 --batch-size 128
 ```bash
 python tools/runtime_timing/run.py \
   --output-dir ./observe-inject-test \
+  --detail full \
   --sample-rate 1 \
   --every-n-steps 1 \
   --collector-port 18765 \
-  --diagnostic-log
+  --diagnostic-log --diagnostic-every 1
 ```
 
 确认目录包含以下文件：
@@ -117,8 +120,9 @@ cat observe-inject-test/config.json
 ```bash
 python tools/runtime_timing/collector.py \
   --output log \
+  --log-format full \
   --port 18765 \
-  --diagnostic-log \
+  --diagnostic-log --diagnostic-every 1 \
   > timing.jsonl \
   2> timing-collector.log
 ```
@@ -218,7 +222,7 @@ tail -1 timing.jsonl | python -m json.tool
 按固定 Trace ID 查看一次请求的全部阶段：
 
 ```bash
-grep '"trace_id": "12345678901234567890123456789012"' timing.jsonl
+grep '12345678901234567890123456789012' timing.jsonl
 ```
 
 如果安装了 `jq`，可以只显示阶段和耗时：
@@ -262,6 +266,8 @@ jq -c 'select(.trace_id == "12345678901234567890123456789012") | {name,request_i
 仅在一次性测试副本中进行。使用缺少 `timing_probe.py` 或包含无效 `config.json` 的测试注入目录启动模型。预期打点被跳过，模型服务仍可用。不要修改正在使用的生产注入目录。
 
 ## 10. 采样验证
+
+精简配置及用法见 [README.md](README.md) 的“日常定界”。独立回归测试覆盖核心/完整阶段切换、诊断限频不影响发送和导出数量、精简 JSON 的 trace 父子关系，以及第 0、50、100 步采样。完整排障命令使用 `--detail full --diagnostic-every 1`，避免把正常限频误判成没有数据。
 
 分别生成注入目录并重启服务验证：
 

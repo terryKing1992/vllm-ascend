@@ -4,10 +4,52 @@
 
 vLLM 0.23 及以上的接口与升级步骤见 [COMPATIBILITY.md](COMPATIBILITY.md)。特别注意：拉取代码后必须重新生成注入目录并重启服务；`PYTHONPATH` 指向旧目录时仍运行旧打点。
 
+## 连加载和 patch 日志都没有：先执行这组检查
+
+在实际模型容器/虚拟环境中执行，目录名必须尚不存在：
+
+```bash
+INJECT_DIR="$PWD/observe-inject-startup-v3"
+python tools/runtime_timing/run.py \
+  --output-dir "$INJECT_DIR" \
+  --sample-rate 1 --every-n-steps 1 --diagnostic-log
+export PYTHONPATH="$INJECT_DIR${PYTHONPATH:+:$PYTHONPATH}"
+python tools/runtime_timing/check.py --inject-dir "$INJECT_DIR" 2>&1
+```
+
+这个检查命令不会手动导入 `sitecustomize` 或 `timing_probe`，不会加载模型或发送数据。它检查的是本次 Python 进程有没有**自动加载**新目录，而不是靠手动导入让结果看起来成功。
+
+预期先看到以下启动日志，再看到 JSON 报告中的 `"status": "PASS"`：
+
+```text
+[timing-bootstrap] loading file=/.../observe-inject-startup-v3/sitecustomize.py pid=...
+[timing-bootstrap] probe_loaded file=/.../observe-inject-startup-v3/timing_probe.py pid=...
+[timing-probe] installed ...
+[timing-bootstrap] ready pid=...
+```
+
+检查命令不导入 vLLM，所以此时没有 `patched=` 是正常的。检查通过后，用**同一解释器环境、同一 PYTHONPATH**和原来的模型参数重启服务，并收集 stderr；目标模块被实际导入后才会出现 patch 日志。独立检查通过，不代表 systemd、Docker 或其他终端中的模型已经继承了这个环境。
+
+| 结果 | 含义与处理 |
+| --- | --- |
+| 没有 `timing-bootstrap` | 检查 `loaded_sitecustomize`、`python` 和启动 flags；也可能生成目录时未启用诊断或服务 stderr 未收集 |
+| `failed phase=config` | 配置文件缺失或 JSON 错误；重新生成目录 |
+| `failed phase=probe_import` | 打点文件导入失败；日志给出异常类型，检查文件是否缺失或过旧 |
+| `failed phase=install` | 配置校验或 hook 安装失败；核对配置并重新生成目录 |
+| `skipped reason=enabled_missing` | 缺少 `enabled` 标记，打点被停用 |
+| `skipped reason=sample_rate_zero` | 采样率为 0，打点不会安装 |
+| `skipped_previous_bundle` | 已跳过 PYTHONPATH 中旧打点的启动脚本，防止新旧目录互相加载 |
+| `existing_sitecustomize_failed` | 环境原有的其他启动脚本执行失败；其原有异常处理行为保留 |
+| `warnings` 提示 `--diagnostic-log` | 默认静默模式仍然生效；重新生成开启诊断的目录 |
+| `bundle_matches_source` 中有 `false` | 注入副本与当前仓库不同或文件缺失，需要重新生成 |
+
+旧版 bootstrap 会静默吞掉打点加载错误；新旧注入目录并存时还可能递归加载。**只更新仓库代码无法修复旧副本，必须重新生成注入目录。** 新版启动诊断在导入打点模块之前执行，模块自身加载失败时也能看到原因。日志仅在生成目录时指定 `--diagnostic-log` 后启用，仍写入 stderr。
+
 ## 日志分别代表什么
 
 | 日志 | 所在进程 | 含义 |
 | --- | --- | --- |
+| `[timing-bootstrap] loading / failed / skipped` | 每个加载注入的 Python 进程 | bootstrap 已执行、加载失败或明确跳过打点 |
 | `[timing-probe] installed` | 模型进程 | Python 已加载注入目录并安装 import hook |
 | `[timing-probe] module=... patched=...` | 模型进程 | 目标 vLLM 模块已导入，并完成方法包装 |
 | `[timing-probe] middleware_installed` | API 进程 | 中间件已经注册到实际 app；`build_app` 被包装本身不代表注册成功 |
@@ -24,6 +66,8 @@ vLLM 0.23 及以上的接口与升级步骤见 [COMPATIBILITY.md](COMPATIBILITY.
 `sent` 不是 collector 的接收确认。UDP 不提供 ACK，collector 未运行时发送端也可能显示 `sent`。
 
 ## 快速判断
+
+高频诊断现在默认只打印首次及每 1000 次事件，`core` 模式也不会打印内部阶段的 patch；缺少某条逐请求日志不代表数据没有上报。先看 `timing.jsonl` 是否增长。需要逐条排障时，生成目录使用 `--detail full --diagnostic-every 1`，collector 使用 `--diagnostic-every 1`，两端均保留 `--diagnostic-log`。精简 JSON 没有冒号后的空格，按 trace 查找时用 `grep '具体TraceID' timing.jsonl` 或 JSON 解析工具。
 
 ```text
 没有 timing-probe
@@ -94,17 +138,16 @@ ls -la observe-inject-v2/trace_transport.py
 INJECT_DIR="$(readlink -f observe-inject-v2)"
 
 PYTHONPATH="$INJECT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
-python -c "import sitecustomize; print('loaded:', sitecustomize.__file__)" 2>&1
+python tools/runtime_timing/check.py --inject-dir "$INJECT_DIR" 2>&1
 ```
 
 预期同时看到：
 
 ```text
 [timing-probe] installed port=18765 sample_rate=1.0 every_n_steps=1
-loaded: /绝对路径/observe-inject-v2/sitecustomize.py
 ```
 
-如果 `loaded:` 指向其他 `sitecustomize.py`，确认注入目录位于 `PYTHONPATH` 最前面。如果报 `ModuleNotFoundError`，检查路径和文件权限。
+JSON 报告应为 `status=PASS`、`hook_installed=true`，且 `loaded_sitecustomize` 指向该注入目录。如果路径不同或为 `null`，检查 PYTHONPATH 顺序和文件权限。不要用手动 `import sitecustomize` 代替此检查，否则可能掩盖自动加载失败。
 
 确认 Python 没有禁用自动加载：
 

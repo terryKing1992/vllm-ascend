@@ -14,12 +14,21 @@ from contextlib import suppress
 from contextvars import ContextVar
 from dataclasses import dataclass
 
-from trace_transport import MAX_RECORDS, MAX_REQUESTS, DatagramEmitter, Packet, Record
+from trace_transport import (
+    DEFAULT_DIAGNOSTIC_EVERY,
+    MAX_RECORDS,
+    MAX_REQUESTS,
+    DatagramEmitter,
+    Packet,
+    Record,
+    diagnostic_due,
+)
 
 TRACE_PACKET_ATTR = "_langfuse_runtime_packet"
 PENDING_PACKET_ATTR = "_langfuse_runtime_pending"
 STEP_ATTR = "_langfuse_runtime_step"
 REQUEST_CONTEXT_ATTR = "_langfuse_runtime_context"
+ENQUEUE_CLOCK_ATTR = "_langfuse_runtime_enqueue_clock"
 MIDDLEWARE_ATTR = "_langfuse_runtime_middleware"
 HTTP_PATHS = frozenset(("/v1/chat/completions", "/v1/completions", "/v1/responses", "/v1/embeddings"))
 STAGE_METHODS = (
@@ -58,6 +67,8 @@ class Config:
     max_requests: int = 4
     collector_port: int = 18765
     diagnostic_log: bool = False
+    diagnostic_every: int = DEFAULT_DIAGNOSTIC_EVERY
+    detail: str = "core"
 
 
 def parse_traceparent(value):
@@ -86,7 +97,9 @@ class Runtime:
     def __init__(self, config, exporter=None):
         self.config = config
         self.exporter = (
-            exporter if exporter is not None else DatagramEmitter(config.collector_port, config.diagnostic_log)
+            exporter
+            if exporter is not None
+            else DatagramEmitter(config.collector_port, config.diagnostic_log, config.diagnostic_every)
         )
         self.request = ContextVar("runtime_request", default=None)
         self.stage = ContextVar("runtime_stage", default=None)
@@ -94,6 +107,7 @@ class Runtime:
         self.disabled = False
         self.failures = 0
         self.diagnostics = set()
+        self.event_counts = {}
 
     def log(self, message):
         if self.config.diagnostic_log:
@@ -104,6 +118,14 @@ class Runtime:
         if self.config.diagnostic_log and key not in self.diagnostics:
             self.diagnostics.add(key)
             self.log(f"{message} pid={os.getpid()}")
+
+    def log_event(self, key, message):
+        if not self.config.diagnostic_log:
+            return
+        count = self.event_counts.get(key, 0) + 1
+        self.event_counts[key] = count
+        if diagnostic_due(count, self.config.diagnostic_every):
+            self.log(f"{message} event_count={count} pid={os.getpid()}")
 
     def safe(self, operation, *args):
         """Only instrumentation enters here; never catch/retry business execution."""
@@ -132,6 +154,23 @@ class Runtime:
         origin, clock = time.time_ns(), time.perf_counter_ns()
         return self.scheduling.set(True), origin, clock
 
+    def mark_scheduler_enqueue(self, signature, scheduler, args, kwargs):
+        request = signature.bind(scheduler, *args, **kwargs).arguments["request"]
+        if scheduler.requests.get(request.request_id) is request and not hasattr(request, ENQUEUE_CLOCK_ATTR):
+            setattr(request, ENQUEUE_CLOCK_ATTR, time.perf_counter_ns())
+
+    def wrap_scheduler_add_request(self, original):
+        signature = inspect.signature(original)
+
+        @functools.wraps(original)
+        def add_request(scheduler, *args, **kwargs):
+            result = original(scheduler, *args, **kwargs)
+            if not self.disabled:
+                self.safe(self.mark_scheduler_enqueue, signature, scheduler, args, kwargs)
+            return result
+
+        return add_request
+
     def finish_schedule(self, state, scheduler, output):
         token, origin, clock = state
         try:
@@ -140,6 +179,8 @@ class Runtime:
             end = origin + time.perf_counter_ns() - clock
             contexts, omitted = [], 0
             for req_id, num_tokens in output.num_scheduled_tokens.items():
+                if num_tokens <= 0:
+                    continue
                 request = scheduler.requests.get(req_id)
                 if request is None:
                     continue
@@ -158,15 +199,19 @@ class Runtime:
                 if len(contexts) >= self.config.max_requests:
                     omitted += 1
                     continue
+                request_metadata = {
+                    "step": step,
+                    "scheduled_tokens": num_tokens,
+                    "phase": "prefill" if request.num_output_tokens == 0 else "decode",
+                }
+                enqueued_at = getattr(request, ENQUEUE_CLOCK_ATTR, None)
+                if step == 0 and enqueued_at is not None and clock >= enqueued_at:
+                    request_metadata["queue_to_first_schedule_ms"] = (clock - enqueued_at) / 1_000_000
                 contexts.append(
                     dict(
                         context,
                         request_id=req_id[:256],
-                        metadata={
-                            "step": step,
-                            "scheduled_tokens": num_tokens,
-                            "phase": "prefill" if request.num_output_tokens == 0 else "decode",
-                        },
+                        metadata=request_metadata,
                     )
                 )
             metadata = {
@@ -174,6 +219,8 @@ class Runtime:
                 "batch_size": len(output.num_scheduled_tokens),
                 "shared_batch_time": True,
                 "omitted_sampled_requests": omitted,
+                "every_n_steps": self.config.every_n_steps,
+                "sample_rate": self.config.sample_rate,
             }
             # Optional built-in types only: uninstrumented workers can unpickle this.
             try:
@@ -303,6 +350,10 @@ class Runtime:
         headers = dict(getattr(prompt, "trace_headers", None) or bound.arguments.get("trace_headers") or {})
         context = self.request.get()
         if context is not None:
+            metadata = context.get("metadata")
+            start_clock = context.get("start_clock")
+            if metadata is not None and start_clock is not None and "api_to_engine_ms" not in metadata:
+                metadata["api_to_engine_ms"] = (time.perf_counter_ns() - start_clock) / 1_000_000
             headers["traceparent"] = context["traceparent"]
             if "trace_headers" in signature.parameters:
                 bound.arguments["trace_headers"] = headers
@@ -314,9 +365,10 @@ class Runtime:
         if trace_context is not None:
             request_id = str(bound.arguments.get("request_id", ""))[:256]
             sampled = selected(trace_context, self.config.sample_rate)
-            self.log(
+            self.log_event(
+                "engine_request",
                 f"engine_request request_id={request_id} trace_id={trace_context['trace_id']} "
-                f"sampled={str(sampled).lower()}"
+                f"sampled={str(sampled).lower()}",
             )
         else:
             self.log_once("engine_missing_trace", "engine_request trace_context=missing check=request_middleware")
@@ -357,7 +409,9 @@ class Runtime:
                 if tracestate:
                     extracted["tracestate"] = tracestate
             sampled = selected(context, self.config.sample_rate)
-            self.log(f"trace_headers trace_id={context['trace_id']} sampled={str(sampled).lower()}")
+            self.log_event(
+                "trace_headers", f"trace_headers trace_id={context['trace_id']} sampled={str(sampled).lower()}"
+            )
             return extracted
 
         return trace_headers
@@ -423,13 +477,15 @@ class Runtime:
                 if inspect.isclass(obj) and obj.__module__ == name and "schedule" in vars(obj):
                     if self.patch_method(obj, "schedule", self.wrap_schedule):
                         patched.append(f"{obj.__name__}.schedule")
+                    if self.patch_method(obj, "add_request", self.wrap_scheduler_add_request, required=("request",)):
+                        patched.append(f"{obj.__name__}.add_request")
         elif name in RUNNER_MODULES:
             runner = getattr(module, "NPUModelRunner", None)
             if self.patch_method(runner, "execute_model", self.wrap_runner, required=("scheduler_output",)):
                 patched.append("NPUModelRunner.execute_model")
             if self.patch_method(runner, "sample_tokens", lambda fn: self.wrap_runner(fn, sampling=True)):
                 patched.append("NPUModelRunner.sample_tokens")
-            for method in STAGE_METHODS:
+            for method in STAGE_METHODS if self.config.detail == "full" else ():
                 if self.patch_method(runner, method, lambda fn, method=method: self.wrap_stage(fn, f"runner.{method}")):
                     patched.append(f"NPUModelRunner.{method}")
         elif name == "vllm.v1.engine.async_llm":
@@ -485,7 +541,8 @@ class Runtime:
         self.log(
             f"installed port={self.config.collector_port} sample_rate={self.config.sample_rate} "
             f"every_n_steps={self.config.every_n_steps} vllm={package_version('vllm')} "
-            f"vllm_ascend={package_version('vllm-ascend')}"
+            f"vllm_ascend={package_version('vllm-ascend')} detail={self.config.detail} "
+            f"diagnostic_every={self.config.diagnostic_every}"
         )
         for name in modules:
             if name in sys.modules:
@@ -544,13 +601,28 @@ class RequestMiddleware:
         incoming = parse_traceparent(headers.get(b"traceparent", b"").decode("ascii", errors="ignore"))
         context = incoming or {"trace_id": uuid.uuid4().hex, "parent_span_id": None, "sampled": True}
         sampled = selected(context, self.runtime.config.sample_rate)
-        self.runtime.log(f"request trace_id={context['trace_id']} sampled={str(sampled).lower()}")
+        self.runtime.log_event("request", f"request trace_id={context['trace_id']} sampled={str(sampled).lower()}")
         span_id = uuid.uuid4().hex[:16]
         traceparent = f"00-{context['trace_id']}-{span_id}-{'01' if sampled else '00'}"
         origin, clock = time.time_ns(), time.perf_counter_ns()
         record = Record("vllm.request", origin, span_id=span_id)
-        token = self.runtime.request.set({"traceparent": traceparent})
+        token = self.runtime.request.set(
+            {"traceparent": traceparent, "start_clock": clock, "metadata": record.metadata}
+        )
         return token, context, sampled, record, origin, clock
+
+    def record_first_body(self, state, message):
+        if state is None or self.runtime.disabled:
+            return
+        _, _, _, record, _, clock = state
+        if (
+            message.get("type") == "http.response.body"
+            and message.get("body")
+            and "response_first_body_ms" not in record.metadata
+        ):
+            # An ASGI response chunk may contain headers/events or an error;
+            # this boundary is not a generated-token TTFT measurement.
+            record.metadata["response_first_body_ms"] = (time.perf_counter_ns() - clock) / 1_000_000
 
     def end(self, state, error):
         token, context, sampled, record, origin, clock = state
@@ -566,9 +638,14 @@ class RequestMiddleware:
         if self.runtime.disabled:
             return await self.app(scope, receive, send)
         state = self.runtime.safe(self.begin, scope)
+
+        async def observed_send(message):
+            self.runtime.safe(self.record_first_body, state, message)
+            return await send(message)
+
         error_name = None
         try:
-            return await self.app(scope, receive, send)
+            return await self.app(scope, receive, observed_send if state is not None else send)
         except BaseException as error:
             error_name = type(error).__name__
             raise
@@ -585,5 +662,7 @@ def install(config):
         raise ValueError("invalid packet limits")
     if not 1024 <= config.collector_port <= 65535:
         raise ValueError("invalid collector port")
+    if config.detail not in ("core", "full") or config.diagnostic_every < 1:
+        raise ValueError("invalid detail or diagnostic interval")
     if config.sample_rate:
         Runtime(config).install()
