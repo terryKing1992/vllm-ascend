@@ -20,7 +20,7 @@ class TestBoundaryTiming(unittest.TestCase):
     def setUp(self):
         self.packets = []
         self.runtime = Runtime(Config(sample_rate=1, every_n_steps=1), SimpleNamespace(submit=self.packets.append))
-        self.scope = {"type": "http", "path": "/v1/completions"}
+        self.scope = {"type": "http", "path": "/v1/completions", "method": "POST"}
 
     def request(self):
         return SimpleNamespace(request_id="request-1", trace_headers={"traceparent": TRACEPARENT}, num_output_tokens=0)
@@ -64,7 +64,16 @@ class TestBoundaryTiming(unittest.TestCase):
         self.assertIs(actual, result)
         self.assertTrue(all(actual is original for actual, original in zip(sent, messages)))
         root = self.packets[0].records[0]
-        self.assertEqual(root.metadata, {"api_to_engine_ms": 3.0, "response_first_body_ms": 8.0})
+        self.assertEqual(
+            root.metadata,
+            {
+                "api_to_engine_ms": 3.0,
+                "response_first_body_ms": 8.0,
+                "http_method": "POST",
+                "http_route": "/v1/completions",
+                "http_status_code": 200,
+            },
+        )
         self.assertEqual(root.end_ns - root.start_ns, 9 * NANOSECONDS_PER_MILLISECOND)
         self.assertEqual(engine_headers[0], engine_headers[1])
         self.assertIsNone(self.runtime.request.get())
@@ -128,6 +137,30 @@ class TestBoundaryTiming(unittest.TestCase):
 
         asyncio.run(RequestMiddleware(app, self.runtime)(self.scope, None, send))
         self.assertNotIn("response_first_body_ms", self.packets[0].records[0].metadata)
+
+    def test_http_status_without_body_preserves_response_and_normalizes_route(self):
+        scope = {**self.scope, "path": "/proxy/v1/completions", "root_path": "/proxy", "method": "custom-method"}
+        scope["headers"] = [(b"authorization", b"test-private-header")]
+        for status in (200, 400, 503, None, True, 999):
+            with self.subTest(status=status):
+                message = {"type": "http.response.start", "status": status}
+                sent = []
+
+                async def send(value, sent=sent):
+                    sent.append(value)
+
+                async def app(scope, receive, send, message=message):
+                    await send(message)
+
+                asyncio.run(RequestMiddleware(app, self.runtime)(scope, None, send))
+                self.assertEqual(len(sent), 1)
+                self.assertIs(sent[0], message)
+                record = self.packets[-1].records[0]
+                expected = {"http_method": "_OTHER", "http_route": "/v1/completions"}
+                if status in (200, 400, 503):
+                    expected["http_status_code"] = status
+                self.assertEqual(record.metadata, expected)
+                self.assertIsNone(record.error)
         self.assertNotIn("api_to_engine_ms", self.packets[0].records[0].metadata)
 
     def test_first_schedule_wait_excludes_schedule_execution_and_zero_token_steps(self):

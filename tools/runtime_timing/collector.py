@@ -4,6 +4,7 @@ import argparse
 import importlib.metadata
 import math
 import os
+import re
 import signal
 import socket
 import sys
@@ -103,6 +104,9 @@ def main():
     parser.add_argument("--queue-size", type=int, default=256)
     parser.add_argument("--flush-at", type=int, default=256)
     parser.add_argument("--flush-interval", type=float, default=2)
+    parser.add_argument("--service-name", default=CollectorConfig.service_name, help="OpenTelemetry service.name")
+    parser.add_argument("--environment", help="Langfuse deployment environment, e.g. production")
+    parser.add_argument("--release", help="Langfuse release and OpenTelemetry service.version")
     parser.add_argument("--diagnostic-log", action="store_true", help="print received packet summaries to stderr")
     parser.add_argument(
         "--diagnostic-every",
@@ -117,6 +121,12 @@ def main():
         parser.error("flush-interval must be positive and finite")
     if args.diagnostic_every < 1:
         parser.error("diagnostic-every must be positive")
+    if not args.service_name.strip():
+        parser.error("service-name must not be empty")
+    if args.environment is not None and not re.fullmatch(r"(?!langfuse)[a-z0-9_-]+", args.environment):
+        parser.error(
+            "environment must use lowercase letters, digits, hyphens or underscores and not start with langfuse"
+        )
     try:
         summary_config = SummaryConfig(args.summary_grace, args.summary_ttl, args.summary_max_requests)
     except ValueError as error:
@@ -138,7 +148,16 @@ def main():
         return RequestSummarySink(summary_config, sink) if args.report == "request" else sink
 
     exporter = BufferedExporter(
-        CollectorConfig(args.queue_size, args.flush_at, args.flush_interval, args.log_format), sink_factory
+        CollectorConfig(
+            queue_size=args.queue_size,
+            flush_at=args.flush_at,
+            flush_interval=args.flush_interval,
+            log_format=args.log_format,
+            service_name=args.service_name,
+            environment=args.environment,
+            release=args.release,
+        ),
+        sink_factory,
     )
     collector = Collector(args.port, exporter, args.diagnostic_log, args.diagnostic_every)
     signal.signal(signal.SIGTERM, collector.stop)

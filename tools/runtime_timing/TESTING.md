@@ -307,10 +307,23 @@ PY
 按 [README.md](README.md) 安装 v3 SDK 并通过运行环境配置服务器和密钥，停止日志 collector，在相同端口启动：
 
 ```bash
-python tools/runtime_timing/collector.py --output langfuse --report request --port 18765
+python tools/runtime_timing/collector.py \
+  --output langfuse --report request --port 18765 \
+  --service-name vllm-ascend-runtime --environment testing \
+  --release runtime-timing-otel-v1 --flush-at 256 --flush-interval 2
 ```
 
 使用新的 Trace ID 重复请求；等待汇总和 SDK 批量发送后，在 Langfuse 按 Trace ID 查找。本工具应为每个 HTTP 请求新增一个 `vllm.request` observation，其 metadata 包含 `timing_summary`，不应有本工具逐 decode 生成的 observation。上游应用可能已有自己的 span，不能把整条 trace 的所有 span 数当成本工具的上报数。
+
+按 [LANGFUSE_OTEL.md](LANGFUSE_OTEL.md) 核对父 span、原始请求时长、可筛选的摘要字段以及 HTTP 状态。HTTP 字段需要使用本次更新后重新生成的注入目录；仅重启 collector 不会为旧数据补出这些字段。`response_first_body_ms` 不应被映射为 Langfuse 的 `completionStartTime`，本工具不生成 TTFT、TPOT、token usage 或费用数据。
+
+在已安装 requirements 的独立环境中运行 OTel 专项测试：
+
+```bash
+python -m unittest discover -s tests/ut -p 'test_runtime_timing_otel.py' -v
+```
+
+测试使用真实 SDK，把 HTTP 出口替换为本地测试响应并解析 OTLP protobuf，核对地址、认证、字段和时间戳。这验证的是导出格式；实际服务器入库和 UI 展示仍需上述联调。基础环境没有 SDK 时可以跳过专项测试，正式验收应安装依赖后执行。
 
 ## 9. 故障隔离测试
 

@@ -3,6 +3,7 @@
 完整的测试用例、联调命令和验收标准见 [TESTING.md](TESTING.md)。没有日志或 JSONL 为空时，按照
 [TROUBLESHOOTING.md](TROUBLESHOOTING.md) 逐层排查。
 多版本支持范围和升级验证方法见 [COMPATIBILITY.md](COMPATIBILITY.md)。
+Langfuse v3 的 OTel 字段映射、服务器配置和验收方法见 [LANGFUSE_OTEL.md](LANGFUSE_OTEL.md)。
 
 连加载/patch 日志都没有时，先执行排查文档开头的 `check.py --inject-dir ...` 检查。新版在开启 `--diagnostic-log` 后提供 `[timing-bootstrap]` 启动诊断，并跳过 PYTHONPATH 中旧打点副本，避免新旧注入目录互相加载；更新后必须重新生成注入目录。
 
@@ -174,8 +175,14 @@ export LANGFUSE_BASE_URL='https://your-langfuse-server'
 export LANGFUSE_PUBLIC_KEY='pk-lf-...'
 export LANGFUSE_SECRET_KEY='sk-lf-...'
 
-./observe-venv/bin/python tools/runtime_timing/collector.py --port 18765 --output langfuse --report request
+./observe-venv/bin/python tools/runtime_timing/collector.py \
+  --port 18765 --output langfuse --report request \
+  --service-name vllm-ascend-runtime --environment production
 ```
+
+依赖固定在 `langfuse>=3.10,<4`。`LANGFUSE_BASE_URL` 填服务器根地址，SDK 自动通过 OTLP HTTP/protobuf 发送到 `/api/public/otel/v1/traces` 并处理认证。`--service-name` 标识服务，`--environment` 标识部署环境，`--release` 可附加部署版本；均只影响 collector 上报。
+
+本次更新后，重启 collector 即可启用新的 OTel 映射，旧注入目录的数据仍可接收。若还需 HTTP 方法、固定路由及响应状态码，必须重新生成注入目录并重启模型。具体映射、批量参数和升级边界见 [LANGFUSE_OTEL.md](LANGFUSE_OTEL.md)。
 
 collector 可以晚于模型启动，也可以单独停止、重启。离线期间的数据丢失，不补发历史数据。
 只监听 127.0.0.1，必须和相应模型进程处于同一网络命名空间。

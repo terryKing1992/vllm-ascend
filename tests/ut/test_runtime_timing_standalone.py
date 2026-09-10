@@ -606,7 +606,7 @@ class TestTracing(unittest.TestCase):
             self.assertEqual(spans[1].parent.span_id, spans[0].context.span_id)
             self.assertEqual(spans[1].start_time, start + 50)
             self.assertEqual(spans[1].end_time, start + 100)
-            self.assertEqual(json.loads(spans[1].attributes["langfuse.observation.metadata"])["pid"], 123)
+            self.assertEqual(spans[1].attributes["langfuse.observation.metadata.pid"], 123)
 
     @unittest.skipUnless(importlib.util.find_spec("langfuse"), "optional Langfuse SDK is not installed")
     def test_real_sdk_exports_one_summary_for_a_thousand_decode_steps(self):
@@ -651,9 +651,9 @@ class TestTracing(unittest.TestCase):
             self.assertEqual(format(span.context.span_id, "016x"), "a" * 16)
             self.assertEqual(format(span.parent.span_id, "016x"), PARENT_ID)
             self.assertEqual((span.start_time, span.end_time), (start, start + 100_000_000))
-            metadata = json.loads(span.attributes["langfuse.observation.metadata"])
-            self.assertEqual(metadata["timing_summary"]["stages"][0]["calls"], 1000)
-            self.assertEqual(metadata["timing_summary"]["stages"][0]["mean_host_ms"], 1)
+            summary = json.loads(span.attributes["langfuse.observation.metadata.timing_summary"])
+            self.assertEqual(summary["stages"][0]["calls"], 1000)
+            self.assertEqual(summary["stages"][0]["mean_host_ms"], 1)
 
     def test_service_survives_missing_and_killed_collector(self):
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as reservation:

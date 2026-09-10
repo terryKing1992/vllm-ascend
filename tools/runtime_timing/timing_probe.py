@@ -31,6 +31,7 @@ REQUEST_CONTEXT_ATTR = "_langfuse_runtime_context"
 ENQUEUE_CLOCK_ATTR = "_langfuse_runtime_enqueue_clock"
 MIDDLEWARE_ATTR = "_langfuse_runtime_middleware"
 HTTP_PATHS = frozenset(("/v1/chat/completions", "/v1/completions", "/v1/responses", "/v1/embeddings"))
+HTTP_METHODS = frozenset(("GET", "HEAD", "POST", "PUT", "DELETE", "CONNECT", "OPTIONS", "TRACE", "PATCH"))
 STAGE_METHODS = (
     "_update_states",
     "_prepare_inputs",
@@ -605,7 +606,13 @@ class RequestMiddleware:
         span_id = uuid.uuid4().hex[:16]
         traceparent = f"00-{context['trace_id']}-{span_id}-{'01' if sampled else '00'}"
         origin, clock = time.time_ns(), time.perf_counter_ns()
-        record = Record("vllm.request", origin, span_id=span_id)
+        method = scope.get("method")
+        record = Record(
+            "vllm.request",
+            origin,
+            span_id=span_id,
+            metadata={"http_route": path, "http_method": method if method in HTTP_METHODS else "_OTHER"},
+        )
         token = self.runtime.request.set(
             {"traceparent": traceparent, "start_clock": clock, "metadata": record.metadata}
         )
@@ -615,6 +622,10 @@ class RequestMiddleware:
         if state is None or self.runtime.disabled:
             return
         _, _, _, record, _, clock = state
+        if message.get("type") == "http.response.start":
+            status = message.get("status")
+            if isinstance(status, int) and not isinstance(status, bool) and 100 <= status <= 599:
+                record.metadata.setdefault("http_status_code", status)
         if (
             message.get("type") == "http.response.body"
             and message.get("body")
